@@ -133,6 +133,9 @@ class MusicliApp:
         self.current_idx = idx
         self.current_track = track
 
+        # ── Extract cover art ─────────────────────────────────────────
+        self._extract_cover_art(track.path)
+
         # Load into engine
         ok = self.engine.load_track(track.path)
         if not ok:
@@ -181,6 +184,32 @@ class MusicliApp:
     def _on_waveform(self, peaks: np.ndarray) -> None:
         if len(peaks) > 0:
             self.waveform_peaks = peaks
+
+    def _extract_cover_art(self, path: str) -> None:
+        """Extract album art from audio file and push to UI."""
+        try:
+            from mutagen import File as MFile
+            mf = MFile(path)
+            if mf is None:
+                self.ui.set_cover_art(None)
+                return
+            art = None
+            # MP3/ID3: APIC keys
+            for key in mf.keys():
+                if key.startswith("APIC:"):
+                    art = mf[key].data
+                    break
+            # MP4/M4A: covr key
+            if art is None and "covr" in mf:
+                covr = mf["covr"]
+                if covr:
+                    art = covr[0] if hasattr(covr[0], 'data') else bytes(covr[0])
+            if art:
+                self.ui.set_cover_art(bytes(art) if not isinstance(art, bytes) else art)
+            else:
+                self.ui.set_cover_art(None)
+        except Exception:
+            self.ui.set_cover_art(None)
 
     def _compute_next_index(self) -> Optional[int]:
         """Determine the next track index. Queue takes priority over
@@ -355,7 +384,12 @@ class MusicliApp:
             self.engine.set_eq(self.state.eq_bass, self.state.eq_mid, self.state.eq_treble)
             return True
 
-        # ── Repeat / Shuffle ────────────────────────────────────────────
+        # ── Help overlay ───────────────────────────────────────────────
+        if key == "?":
+            self.ui.show_help = not self.ui.show_help
+            return True
+
+        # ── Repeat / Shuffle ──────────────────────────────────────────────
         if key in ("r", "R"):
             modes = ["off", "track", "album"]
             idx = modes.index(self.state.repeat_mode) if self.state.repeat_mode in modes else 0
@@ -449,6 +483,7 @@ class MusicliApp:
                     position = self.engine.position
                     duration = self.engine.duration
                     fft_data = self.engine.get_fft_data() if self.engine.is_playing else None
+                    fft_stereo = self.engine.get_fft_stereo() if self.engine.is_playing else None
 
                     # ── Update UI ──────────────────────────────────────
                     self.ui.update(
@@ -471,6 +506,7 @@ class MusicliApp:
                         shuffle=self.state.shuffle,
                         queue_indices=self.queue,
                         crossfade=self.state.crossfade,
+                        fft_stereo=fft_stereo,
                     )
 
                     # ── Pacing ─────────────────────────────────────────
@@ -541,7 +577,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.version:
-        print(f"musicli v0.1.0")
+        print(f"musicli v0.2.0")
         return
 
     # ── Setup logging (non-intrusive) ───────────────────────────────────

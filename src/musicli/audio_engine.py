@@ -116,6 +116,14 @@ class AudioEngine:
         mono = (frame[0::2] + frame[1::2]) * 0.5
         return mono
 
+    def get_fft_stereo(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return left and right channels separately for stereo FFT."""
+        with self._fft_lock:
+            frame = self._fft_buffer.copy()
+        left = frame[0::2].copy()
+        right = frame[1::2].copy()
+        return left, right
+
     # ── Track loading ────────────────────────────────────────────────────
 
     def load_track(self, path: str) -> bool:
