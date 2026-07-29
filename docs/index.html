@@ -24,6 +24,7 @@
     box-shadow: 0 0 40px rgba(255, 204, 0, 0.08);
   }
   h1 { font-size: 3rem; color: #ffcc00; text-shadow: 0 0 20px rgba(255,204,0,0.3); letter-spacing: 4px; }
+  .version { color: #665500; font-size: 0.8rem; margin-top: 0.2rem; }
   .tagline { color: #aa7700; font-size: 1.1rem; margin-top: 0.5rem; }
   .badges { margin: 1rem 0; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
   .badge {
@@ -42,6 +43,17 @@
   .terminal .prompt { color: #aa7700; }
   .terminal .cmd { color: #ffcc00; }
   .terminal .out { color: #887700; }
+  .theme-swatches { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin: 1rem 0; }
+  .theme-swatch {
+    padding: 6px 14px; border-radius: 4px; font-size: 0.75rem; font-weight: 700;
+    border: 1px solid #665500;
+  }
+  .swatch-amber { background: #1a1500; color: #ffcc00; }
+  .swatch-synth { background: #0d0221; color: #00ffff; }
+  .swatch-green { background: #002200; color: #33ff33; }
+  .swatch-5151  { background: #221100; color: #cc8800; }
+  .swatch-matrix { background: #001a0a; color: #00ff66; }
+  .swatch-cyber { background: #220011; color: #ff0066; }
   h2 { color: #ffcc00; margin: 2rem 0 1rem; font-size: 1.4rem; border-bottom: 1px solid #443300; padding-bottom: 0.5rem; }
   h3 { color: #ffb000; margin: 1.5rem 0 0.5rem; }
   .features { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 1rem; margin: 1.5rem 0; }
@@ -68,51 +80,86 @@
   .btn:hover { background: #cc9900; }
   footer { text-align: center; color: #554400; padding: 3rem 0 1rem; font-size: 0.8rem; }
   a { color: #ffcc00; }
-  .demo-ascii { font-size: 0.7rem; line-height: 1.3; color: #aa7700; margin: 1rem 0; }
+  .demo-ascii { font-size: 0.65rem; line-height: 1.25; color: #aa7700; margin: 1rem 0; white-space: pre; }
+  .cover-art-demo { display: flex; gap: 2rem; align-items: flex-start; margin: 1rem 0; }
+  .cover-box {
+    background: #050300; border: 1px solid #665500; border-radius: 4px;
+    padding: 0.5rem; font-size: 0.5rem; line-height: 1.15; color: #ffcc00;
+    flex-shrink: 0;
+  }
+  .whatsnew { background: #221100; border-left: 3px solid #ffcc00; padding: 1rem; margin: 1rem 0; border-radius: 0 4px 4px 0; }
+  .whatsnew li { color: #dd9900; margin: 0.3rem 0; font-size: 0.85rem; }
 </style>
 </head>
 <body>
 <div class="container">
   <header>
     <h1>▌ MUSICLI</h1>
+    <p class="version">v0.2.0</p>
     <p class="tagline">Premium retro CRT/VGA CLI music player</p>
     <div class="badges">
       <span class="badge">Python 3.10+</span>
       <span class="badge">Cross-platform</span>
       <span class="badge">Gapless playback</span>
       <span class="badge">3-Band EQ</span>
+      <span class="badge">Cover art</span>
+      <span class="badge">6 themes</span>
       <span class="badge">MIT License</span>
     </div>
   </header>
 
   <div class="crt">
-    <pre>
-┌──────────────────────────────────────────────────────────┐
-│  musicli │ XF:ON │ SPACE:P/P ... Q:Quit                  │
-├────────────────────────┬─────────────────────────────────┤
-│                        │ NOW PLAYING                     │
-│ ARTIST                 │ Track Title                     │
-│   Album                │ Artist  |  Album                │
-│    01. Track One       │                                 │
-│    02. Track Two     ▶ │ 1:23 ████████░░░░░░░░░░ 3:45   │
-│    03. Track Three     │                                 │
-│                        │ VOL 80% ████████░░░░░░░░░░      │
-│                        │ B [████─] +0dB  M [████─] +0dB │
-│                        │ ────────────────────────────────│
-│                        │  past lyrics                    │
-│                        │ ▌ current lyric ▏               │
-├────────────────────────┼─────────────────────────────────┤
-│                        │ VISUALIZER [Blocks]             │
-│                        │ ████▅▃▁▁▃▅████▅▃▁▁▃▅████        │
-│                        │                  ▲              │
-└────────────────────────┴─────────────────────────────────┘</pre>
+    <div class="demo-ascii">┌──────────────────────────────────────────────────────────────┐
+│  musicli │ XF:ON │ SPACE:P/P  ENTER:Play  ?:Help  Q:Quit    │
+├──────────────────────────┬───────────────────────────────────┤
+│                          │ NOW PLAYING                       │
+│ ARTIST                   │ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄  │
+│   Album                  │ ▄▄▄▄▄▄▄▄▄▄███████████████████████▄ │
+│    01. Track One         │ ▄▄▄·········████████████████···▄▄▄▄ │  ← cover art
+│    02. Track Two       ▶ │ ▄···▄▄▄▄▄▄▄▄███████████████▄▄▄▄··· │     ANSI
+│    03. Track Three       │ ▄▄▄▄▄▄▄▄▄▄▄▄███████████████▄▄▄▄▄▄  │     half-blocks
+│                          │ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄  │
+│                          │  Track Title                      │
+│                          │  Artist  |  Album                 │
+│                          │  1:23 ████████░░░░░░░░░░ 3:45    │
+│                          │  VOL 80% ████████░░░░░░░          │
+│                          │  B [████─] +0dB  M [███──] -2dB  │
+│                          ├───────────────────────────────────┤
+│                          │ VISUALIZER [Blocks]               │
+│                          │  L ▁▃▅████▃▁▁▃▅████▃▁             │  ← stereo VU
+│                          │  R ▃▃▅███▅▃▁▁▃▄███▅▃▃             │     (L/R)
+│                          │  ▁▂▃▄▅▆▇█▇▆▅▄▃▂▁▁▂▃▄▅▆▇█▇▆▅▄▃▂▁  │  ← waveform
+│                          │                  ▲               │
+└──────────────────────────┴───────────────────────────────────┘</div>
   </div>
+
+  <div class="whatsnew">
+    <strong style="color: #ffcc00;">v0.2.0 what's new</strong>
+    <ul>
+      <li>🎨 <strong>Cover art</strong> — album art renders as ANSI half-blocks at full color</li>
+      <li>🎨 <strong>6 retro themes</strong> — Amber, Synthwave, CRT Green, IBM 5151, Matrix Rain, Cyberpunk</li>
+      <li>📊 <strong>Stereo FFT VU meter</strong> — per-channel spectrum bars (L/R)</li>
+      <li>❓ <strong>Help overlay</strong> — press <kbd style="background:#221100;border:1px solid #665500;padding:1px 4px;color:#ffcc00;">?</kbd> for all keybindings</li>
+    </ul>
+  </div>
+
+  <h2>Themes</h2>
+  <div class="theme-swatches">
+    <span class="theme-swatch swatch-amber">CRT Amber</span>
+    <span class="theme-swatch swatch-synth">VGA Synthwave</span>
+    <span class="theme-swatch swatch-green">CRT Green</span>
+    <span class="theme-swatch swatch-5151">IBM 5151</span>
+    <span class="theme-swatch swatch-matrix">Matrix Rain</span>
+    <span class="theme-swatch swatch-cyber">Cyberpunk</span>
+  </div>
+  <p style="color: #887700; font-size: 0.8rem; text-align: center;">Cycle with <kbd style="background:#221100;border:1px solid #665500;padding:1px 4px;color:#ffcc00;">t</kbd></p>
 
   <h2>Install</h2>
   <div class="terminal">
     <span class="prompt">$</span> <span class="cmd">pip install musicli</span><br>
     <span class="prompt">$</span> <span class="cmd">cd ~/Music</span><br>
-    <span class="prompt">$</span> <span class="cmd">musicli</span>
+    <span class="prompt">$</span> <span class="cmd">musicli</span><br>
+    <span class="out">Now playing: 6 themes, cover art, stereo VU</span>
   </div>
 
   <h2>Features</h2>
@@ -120,7 +167,7 @@
     <div class="feature">
       <div class="icon">🎵</div>
       <div class="title">Format Support</div>
-      <div class="desc">MP3, FLAC, WAV with automatic metadata extraction</div>
+      <div class="desc">MP3, FLAC, WAV with automatic metadata extraction and cover art</div>
     </div>
     <div class="feature">
       <div class="icon">🎚️</div>
@@ -129,13 +176,18 @@
     </div>
     <div class="feature">
       <div class="icon">📊</div>
-      <div class="title">Real-time Visualizer</div>
-      <div class="desc">FFT spectrum bars + waveform display with position marker</div>
+      <div class="title">Stereo Visualizer</div>
+      <div class="desc">Per-channel FFT spectrum (L/R) + waveform with position marker</div>
     </div>
     <div class="feature">
       <div class="icon">🎨</div>
-      <div class="title">Retro Themes</div>
-      <div class="desc">CRT Amber and VGA Synthwave — full terminal aesthetic</div>
+      <div class="title">6 Retro Themes</div>
+      <div class="desc">Amber, Synthwave, Green, IBM 5151, Matrix, Cyberpunk — cycle live</div>
+    </div>
+    <div class="feature">
+      <div class="icon">🖼️</div>
+      <div class="title">Cover Art</div>
+      <div class="desc">Album art extracted from tags and rendered as ANSI half-blocks</div>
     </div>
     <div class="feature">
       <div class="icon">⏭️</div>
@@ -157,6 +209,11 @@
       <div class="title">Play Queue</div>
       <div class="desc">Add, reorder, and clear tracks on the fly</div>
     </div>
+    <div class="feature">
+      <div class="icon">❓</div>
+      <div class="title">Help Overlay</div>
+      <div class="desc">Press ? to view all keybindings without pausing playback</div>
+    </div>
   </div>
 
   <h2>Controls</h2>
@@ -169,13 +226,18 @@
     <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>Seek -10s / +10s</td></tr>
     <tr><td><kbd>+</kbd> / <kbd>-</kbd></td><td>Volume up / down</td></tr>
     <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></td><td>EQ boost +2dB (Bass/Mid/Treble)</td></tr>
-    <tr><td><kbd>Shift+1/2/3</kbd></td><td>EQ cut -2dB</td></tr>
-    <tr><td><kbd>r</kbd></td><td>Cycle repeat mode</td></tr>
+    <tr><td><kbd>!</kbd> <kbd>@</kbd> <kbd>#</kbd></td><td>EQ cut -2dB</td></tr>
+    <tr><td><kbd>r</kbd></td><td>Cycle repeat mode (off → track → album)</td></tr>
     <tr><td><kbd>s</kbd></td><td>Toggle shuffle</td></tr>
     <tr><td><kbd>c</kbd></td><td>Toggle crossfade</td></tr>
-    <tr><td><kbd>t</kbd></td><td>Cycle theme</td></tr>
+    <tr><td><kbd>t</kbd></td><td>Cycle theme (6 themes)</td></tr>
     <tr><td><kbd>w</kbd></td><td>Cycle waveform style</td></tr>
     <tr><td><kbd>/</kbd></td><td>Search library</td></tr>
+    <tr><td><kbd>a</kbd></td><td>Add current track to queue</td></tr>
+    <tr><td><kbd>d</kbd></td><td>Remove current from queue</td></tr>
+    <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>Move queue item</td></tr>
+    <tr><td><kbd>x</kbd></td><td>Clear queue</td></tr>
+    <tr><td><kbd>?</kbd></td><td>Toggle help overlay</td></tr>
     <tr><td><kbd>q</kbd></td><td>Quit (saves state)</td></tr>
   </table>
 
@@ -183,17 +245,18 @@
   <div class="terminal">
 File → miniaudio → ReplayGain → 3-Band EQ → Volume → TPDF Dither → Speaker
                                             ↓
-                                       FFT → Visualizer
+                                       FFT L+R → Stereo Visualizer
   </div>
 
   <h2>Get Started</h2>
   <div class="crt" style="text-align: center;">
-    <p style="margin-bottom: 1rem;">Install from PyPI and launch in your music directory.</p>
+    <p style="margin-bottom: 1rem;">Install and launch in your music directory.</p>
     <a href="https://github.com/Arkhos-Overlord/musicli" class="btn">View on GitHub →</a>
+    <a href="https://github.com/Arkhos-Overlord/musicli/releases/tag/v0.2.0" class="btn" style="margin-left: 8px;">Download v0.2.0</a>
   </div>
 
   <footer>
-    <p>musicli — MIT License — Built with Python, miniaudio, NumPy, SciPy, Rich</p>
+    <p>musicli v0.2.0 — MIT License — Built with Python, miniaudio, NumPy, SciPy, Rich, Pillow</p>
   </footer>
 </div>
 </body>
