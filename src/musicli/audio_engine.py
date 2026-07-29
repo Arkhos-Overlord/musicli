@@ -204,7 +204,7 @@ class AudioEngine:
 
     def play(self) -> None:
         """Start or resume playback."""
-        if self._device is None or self._device.is_stopped:
+        if self._device is None or not self._device.running:
             self._start_device()
         self._playing = True
         self._paused = False
@@ -224,7 +224,7 @@ class AudioEngine:
             self._next_duration = 0.0
             self._crossfade_remaining = 0
             self._tail_write = 0
-        if self._device and not self._device.is_stopped:
+        if self._device and self._device.running:
             self._device.stop()
             self._device.close()
             self._device = None
@@ -314,172 +314,176 @@ class AudioEngine:
     def _start_device(self) -> None:
         """Create and start the miniaudio playback device."""
         if self._device:
-            self._device.stop()
+            if self._device.running:
+                self._device.stop()
             self._device.close()
 
         self._device = miniaudio.PlaybackDevice(
-            output_format=miniaudio.SampleFormat.SIGNED16,
+            output_format=miniaudio.SampleFormat.FLOAT32,
             nchannels=CHANNELS,
             sample_rate=TARGET_SAMPLE_RATE,
         )
-        self._device.start(self._data_callback)
+        gen = self._callback_generator()
+        next(gen)  # prime the generator
+        self._device.start(gen)
 
-    def _data_callback(self, frame_count: int) -> bytes:
-        """miniaudio data callback — runs in a dedicated C thread.
+    def _callback_generator(self):
+        """Generator-based audio callback for new miniaudio API.
 
-        Implements gapless + crossfade: tail samples of the old track are
-        accumulated in a ring buffer; on switch, they crossfade with the
-        first frames of the new track for CROSSFADE_FRAMES samples.
+        Uses the single-yield pattern: ``frame_count = yield output``.
+        Each ``.send(frame_count)`` call receives the frame count AND
+        yields the processed audio bytes in one step.
         """
-        needed = frame_count * CHANNELS
+        # Initial silence buffer to yield on the priming call
+        output = b"\x00" * (BUFFER_FRAMES * CHANNELS * 2)
+        while True:
+            frame_count = yield output
+            needed = frame_count * CHANNELS
 
-        with self._lock:
-            decoder = self._current_decoder
-            paused = self._paused
-
-        if decoder is None or paused:
-            # Clear crossfade state during silence/pause
-            self._crossfade_remaining = 0
-            self._tail_write = 0
-            return b"\x00" * (needed * 2)  # int16 silence
-
-        # ── Read decoded float32 samples ────────────────────────────────
-        try:
             with self._lock:
-                result = decoder.read(frame_count)
-        except Exception:
-            return b"\x00" * (needed * 2)
+                decoder = self._current_decoder
+                paused = self._paused
 
-        switched_this_call = False
-
-        if result is None:
-            # Track finished — try auto-switch to preloaded next
-            with self._lock:
-                next_dec = self._next_decoder
-                next_path = self._next_path
-                next_rg = self._next_replaygain_db
-                next_duration = self._next_duration
-
-            if next_dec is not None:
-                # Save tail buffer for crossfade (copy the ring buffer)
-                do_crossfade = self._crossfade_enabled and self._tail_write > 0
-                if do_crossfade:
-                    cf_frames = min(CROSSFADE_FRAMES,
-                                    self._tail_write // CHANNELS)
-                    cf_len = cf_frames * CHANNELS
-                    # Build tail from ring buffer (last cf_len samples)
-                    tail = np.zeros(cf_len, dtype=np.float32)
-                    src_end = self._tail_write
-                    src_start = max(0, src_end - cf_len)
-                    tail[:cf_len] = self._tail_buffer[src_start:src_end]
-                    self._crossfade_remaining = cf_frames
-                else:
-                    self._crossfade_remaining = 0
-                self._tail_write = 0
-
-                # Gapless switch
-                with self._lock:
-                    self._current_decoder = next_dec
-                    self._current_path = next_path
-                    self._next_decoder = None
-                    self._next_path = ""
-                    self._replaygain_db = next_rg
-                    self._duration = next_duration
-                    self._position_callback_frame = 0.0
-                    self._just_switched = True
-                    self._switched_to_path = next_path
-                    n_sections = self._eq.sos.shape[0]
-                    self._eq.zi_per_channel = [
-                        np.zeros((n_sections, 2)) for _ in range(2)
-                    ]
-                    decoder = self._current_decoder
-
-                try:
-                    with self._lock:
-                        result = decoder.read(frame_count)
-                except Exception:
-                    return b"\x00" * (needed * 2)
-
-                # ── Apply crossfade blend ───────────────────────────────
-                if do_crossfade and self._crossfade_remaining > 0 and result is not None:
-                    new_samples = np.frombuffer(result, dtype=np.float32)
-                    actual_frames = len(new_samples) // CHANNELS
-                    blend_frames = min(actual_frames, self._crossfade_remaining)
-                    blend_len = blend_frames * CHANNELS
-                    # Build ramp: old fades 1→0, new fades 0→1
-                    ramp = np.linspace(0.0, 1.0, blend_frames, dtype=np.float32)
-                    ramp_stereo = np.repeat(ramp, CHANNELS)
-                    # Read new decoder output directly into result
-                    result_bytes = bytearray(result)
-                    new_view = np.frombuffer(result_bytes, dtype=np.float32)
-                    if blend_len <= len(tail):
-                        new_view[:blend_len] = (
-                            tail[:blend_len] * (1.0 - ramp_stereo)
-                            + new_view[:blend_len] * ramp_stereo
-                        )
-                    result = bytes(result_bytes)
-                    self._crossfade_remaining -= blend_frames
-
-                switched_this_call = True
-            else:
-                self._playing = False
+            if decoder is None or paused:
                 self._crossfade_remaining = 0
-                return b"\x00" * (needed * 2)
+                self._tail_write = 0
+                output = b"\x00" * (needed * 2)
+                continue
 
-        if result is None:
-            self._playing = False
-            self._crossfade_remaining = 0
-            return b"\x00" * (needed * 2)
+            # ── Read decoded float32 samples ────────────────────────────
+            try:
+                with self._lock:
+                    result = decoder.read(frame_count)
+            except Exception:
+                output = b"\x00" * (needed * 2)
+                continue
 
-        samples = np.frombuffer(result, dtype=np.float32).copy()
+            switched_this_call = False
 
-        # Pad with silence if we got fewer frames
-        actual_frames = len(samples) // CHANNELS
-        if actual_frames < frame_count:
-            pad = np.zeros((frame_count - actual_frames) * CHANNELS, dtype=np.float32)
-            samples = np.concatenate([samples, pad])
-            if not switched_this_call:
+            if result is None:
+                # Track finished — try auto-switch to preloaded next
                 with self._lock:
                     next_dec = self._next_decoder
-                if next_dec is None:
+                    next_path = self._next_path
+                    next_rg = self._next_replaygain_db
+                    next_duration = self._next_duration
+
+                if next_dec is not None:
+                    do_crossfade = self._crossfade_enabled and self._tail_write > 0
+                    if do_crossfade:
+                        cf_frames = min(CROSSFADE_FRAMES,
+                                        self._tail_write // CHANNELS)
+                        cf_len = cf_frames * CHANNELS
+                        tail = np.zeros(cf_len, dtype=np.float32)
+                        src_end = self._tail_write
+                        src_start = max(0, src_end - cf_len)
+                        tail[:cf_len] = self._tail_buffer[src_start:src_end]
+                        self._crossfade_remaining = cf_frames
+                    else:
+                        self._crossfade_remaining = 0
+                    self._tail_write = 0
+
+                    # Gapless switch
+                    with self._lock:
+                        self._current_decoder = next_dec
+                        self._current_path = next_path
+                        self._next_decoder = None
+                        self._next_path = ""
+                        self._replaygain_db = next_rg
+                        self._duration = next_duration
+                        self._position_callback_frame = 0.0
+                        self._just_switched = True
+                        self._switched_to_path = next_path
+                        n_sections = self._eq.sos.shape[0]
+                        self._eq.zi_per_channel = [
+                            np.zeros((n_sections, 2)) for _ in range(2)
+                        ]
+                        decoder = self._current_decoder
+
+                    try:
+                        with self._lock:
+                            result = decoder.read(frame_count)
+                    except Exception:
+                        output = b"\x00" * (needed * 2)
+                        continue
+
+                    # ── Apply crossfade blend ───────────────────────────
+                    if do_crossfade and self._crossfade_remaining > 0 and result is not None:
+                        new_samples = np.frombuffer(result, dtype=np.float32)
+                        actual_frames = len(new_samples) // CHANNELS
+                        blend_frames = min(actual_frames, self._crossfade_remaining)
+                        blend_len = blend_frames * CHANNELS
+                        ramp = np.linspace(0.0, 1.0, blend_frames, dtype=np.float32)
+                        ramp_stereo = np.repeat(ramp, CHANNELS)
+                        result_bytes = bytearray(result)
+                        new_view = np.frombuffer(result_bytes, dtype=np.float32)
+                        if blend_len <= len(tail):
+                            new_view[:blend_len] = (
+                                tail[:blend_len] * (1.0 - ramp_stereo)
+                                + new_view[:blend_len] * ramp_stereo
+                            )
+                        result = bytes(result_bytes)
+                        self._crossfade_remaining -= blend_frames
+
+                    switched_this_call = True
+                else:
                     self._playing = False
+                    self._crossfade_remaining = 0
+                    output = b"\x00" * (needed * 2)
+                    continue
 
-        # ── Update tail buffer (ring buffer) ────────────────────────────
-        if not switched_this_call:
-            # Normal play: accumulate tail for potential crossfade
-            samples_len = len(samples)
-            tail_buf = self._tail_buffer
-            tail_len = len(tail_buf)
-            w = self._tail_write
-            remaining = tail_len - w
-            if samples_len <= remaining:
-                tail_buf[w:w + samples_len] = samples
-                self._tail_write = w + samples_len
-            else:
-                # Wrap around
-                tail_buf[w:] = samples[:remaining]
-                overflow = samples_len - remaining
-                tail_buf[:overflow] = samples[remaining:]
-                self._tail_write = overflow
+            if result is None:
+                self._playing = False
+                self._crossfade_remaining = 0
+                output = b"\x00" * (needed * 2)
+                continue
 
-        # ── Update position ─────────────────────────────────────────────
-        with self._lock:
-            self._position_callback_frame += actual_frames / TARGET_SAMPLE_RATE
+            samples = np.frombuffer(result, dtype=np.float32).copy()
 
-        # ── Copy to FFT buffer (thread-safe) ────────────────────────────
-        with self._fft_lock:
-            self._fft_buffer[: len(samples)] = samples
+            # Pad with silence if we got fewer frames
+            actual_frames = len(samples) // CHANNELS
+            if actual_frames < frame_count:
+                pad = np.zeros((frame_count - actual_frames) * CHANNELS, dtype=np.float32)
+                samples = np.concatenate([samples, pad])
+                if not switched_this_call:
+                    with self._lock:
+                        next_dec = self._next_decoder
+                    if next_dec is None:
+                        self._playing = False
 
-        # ── DSP Pipeline (all numpy) ────────────────────────────────────
-        if self._replaygain_db != 0.0:
-            linear = 10.0 ** (self._replaygain_db / 20.0)
-            np.multiply(samples, linear, out=samples)
+            # ── Update tail buffer (ring buffer) ────────────────────────
+            if not switched_this_call:
+                samples_len = len(samples)
+                tail_buf = self._tail_buffer
+                tail_len = len(tail_buf)
+                w = self._tail_write
+                remaining = tail_len - w
+                if samples_len <= remaining:
+                    tail_buf[w:w + samples_len] = samples
+                    self._tail_write = w + samples_len
+                else:
+                    tail_buf[w:] = samples[:remaining]
+                    overflow = samples_len - remaining
+                    tail_buf[:overflow] = samples[remaining:]
+                    self._tail_write = overflow
 
-        samples = self._eq.process(samples, CHANNELS)
+            # ── Update position ─────────────────────────────────────────
+            with self._lock:
+                self._position_callback_frame += actual_frames / TARGET_SAMPLE_RATE
 
-        vol = 0.0 if self._muted else self._volume
-        if vol != 1.0:
-            np.multiply(samples, vol, out=samples)
+            # ── Copy to FFT buffer (thread-safe) ────────────────────────
+            with self._fft_lock:
+                self._fft_buffer[: len(samples)] = samples
 
-        output = apply_tpdf_dither(samples)
-        return output.tobytes()
+            # ── DSP Pipeline (all numpy) ────────────────────────────────
+            if self._replaygain_db != 0.0:
+                linear = 10.0 ** (self._replaygain_db / 20.0)
+                np.multiply(samples, linear, out=samples)
+
+            samples = self._eq.process(samples, CHANNELS)
+
+            vol = 0.0 if self._muted else self._volume
+            if vol != 1.0:
+                np.multiply(samples, vol, out=samples)
+
+            output = apply_tpdf_dither(samples).tobytes()
