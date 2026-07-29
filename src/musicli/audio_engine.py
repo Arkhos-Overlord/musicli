@@ -318,7 +318,7 @@ class AudioEngine:
             self._device.close()
 
         self._device = miniaudio.PlaybackDevice(
-            output_format=miniaudio.SampleFormat.INT16,
+            output_format=miniaudio.SampleFormat.SIGNED16,
             nchannels=CHANNELS,
             sample_rate=TARGET_SAMPLE_RATE,
         )
