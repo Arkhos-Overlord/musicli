@@ -10,8 +10,10 @@ from typing import Any, Dict, List
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 
-CACHE_FILE = Path(".cli_player_cache.json")
-STATE_FILE = Path(".cli_player_state.json")
+# Store data in the user's home directory to avoid polluting music folders
+CONFIG_DIR = Path.home() / ".musicli"
+CACHE_FILE = CONFIG_DIR / "library_cache.json"
+STATE_FILE = CONFIG_DIR / "player_state.json"
 
 
 # ── Models ──────────────────────────────────────────────────────────────────
@@ -65,6 +67,7 @@ def load_cache() -> List[Dict[str, Any]]:
 
 def save_cache(tracks: List[Dict[str, Any]]) -> None:
     """Save library scan results to cache."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_FILE.write_text(json.dumps(tracks, indent=2), encoding="utf-8")
 
 
@@ -85,6 +88,7 @@ def load_state() -> PlayerState:
 
 def save_state(state: PlayerState) -> None:
     """Persist player state to disk."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(
         json.dumps(asdict(state), indent=2), encoding="utf-8"
     )
