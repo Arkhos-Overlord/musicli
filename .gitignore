@@ -21,6 +21,12 @@ Thumbs.db
 # Logs
 *.log
 
+# Build artifacts
+build/
+*.egg-info/
+*.whl
+dist/
+
 # musicli state/cache
 .cli_player_cache.json
 .cli_player_state.json
