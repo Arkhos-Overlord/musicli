@@ -1,0 +1,26 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual env
+venv/
+.venv/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# musicli state/cache
+.cli_player_cache.json
+.cli_player_state.json
