@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
-TARGET_SAMPLE_RATE = 48000  # more practical than 96k for realtime CLI
+TARGET_SAMPLE_RATE = 96000  # High-Fidelity standard for clean, crisp audio
 CHANNELS = 2
 BYTES_PER_SAMPLE = 4  # float32
 BUFFER_FRAMES = 1024
-CROSSFADE_FRAMES = 2000  # ~42ms at 48kHz
+CROSSFADE_FRAMES = 2000  # ~21ms at 96kHz
 
 
 # ── Engine ──────────────────────────────────────────────────────────────────

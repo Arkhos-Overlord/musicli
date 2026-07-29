@@ -118,18 +118,21 @@ class EQPipeline:
 
     def process(self, samples: np.ndarray, channels: int = 2) -> np.ndarray:
         """Apply the EQ cascade to a mono or interleaved-stereo buffer.
-
-        `samples` is a 1D float32 array; if stereo it's interleaved L,R,L,R,...
-        Returns the filtered array (same shape).
+        
+        Internal processing uses float64 to prevent rounding noise and 
+        maintain crisp transients.
         """
+        # Convert to float64 for high-precision internal processing
+        s64 = samples.astype(np.float64, copy=True)
+        
         if channels == 1:
             out, self.zi_per_channel[0] = signal.sosfilt(
-                self.sos, samples, zi=self.zi_per_channel[0]
+                self.sos, s64, zi=self.zi_per_channel[0]
             )
             return out.astype(np.float32, copy=False)
         else:
-            left = samples[0::2]
-            right = samples[1::2]
+            left = s64[0::2]
+            right = s64[1::2]
             left_out, self.zi_per_channel[0] = signal.sosfilt(
                 self.sos, left, zi=self.zi_per_channel[0]
             )
@@ -137,8 +140,8 @@ class EQPipeline:
                 self.sos, right, zi=self.zi_per_channel[1]
             )
             out = np.empty(len(samples), dtype=np.float32)
-            out[0::2] = left_out
-            out[1::2] = right_out
+            out[0::2] = left_out.astype(np.float32, copy=False)
+            out[1::2] = right_out.astype(np.float32, copy=False)
             return out
 
 
@@ -171,26 +174,27 @@ def apply_replaygain(
 
 
 def soft_clip_float32(samples: np.ndarray) -> np.ndarray:
-    """Clamp float32 samples to [-1, 1] with a soft knee near the rails.
+    """Clamp float32 samples to [-1, 1] with a smooth high-fidelity knee.
 
-    Keeps output in FLOAT32 device format (no int16 quantization).
-    Soft clip prevents hard digital clipping when EQ/ReplayGain push peaks.
+    Keeps output in FLOAT32 device format.
     """
-    # tanh soft-clip only samples that would clip; leave the rest alone
+    # Use a cubic soft-clip for a more natural 'analog' saturation
+    # when the signal exceeds 0.9. This is crisper than tanh.
     abs_s = np.abs(samples)
-    mask = abs_s > 0.95
+    mask = abs_s > 0.9
     if np.any(mask):
         out = samples.copy()
-        # Map overshoot into a gentle curve approaching ±1
         over = out[mask]
         sign = np.sign(over)
         mag = np.abs(over)
-        # Blend linear → tanh beyond 0.95
-        t = (mag - 0.95) / 0.05  # 0 at 0.95, 1 at 1.0+
-        t = np.clip(t, 0.0, 1.0)
-        soft = np.tanh(mag)
-        out[mask] = sign * ((1.0 - t) * mag + t * soft)
+        
+        # Cubic knee: y = 0.9 + (mag-0.9) / (1 + (mag-0.9)^2)
+        # This provides a softer approach to the 1.0 rail.
+        diff = mag - 0.9
+        soft = 0.9 + diff / (1.0 + diff**2)
+        out[mask] = sign * soft
         return np.clip(out, -1.0, 1.0).astype(np.float32)
+        
     return np.clip(samples, -1.0, 1.0).astype(np.float32)
 
 
