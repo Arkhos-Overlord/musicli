@@ -8,22 +8,9 @@ import numpy as np
 from scipy import signal
 
 
-# ── Biquad Filter Design (RBJ Audio EQ Cookbook via bilinear transform) ─────
-
-
-def _design_biquad(
-    b_analog: np.ndarray,
-    a_analog: np.ndarray,
-    fs: float,
-) -> np.ndarray:
-    """Convert analog biquad coefficients to digital SOS via bilinear transform."""
-    # Normalize constants so b[0] / a[0] = 1.0
-    g = b_analog[0] / a_analog[0]
-    zeros = np.roots(b_analog)
-    poles = np.roots(a_analog)
-    zpk = signal.bilinear_zpk(zeros, poles, g, fs)
-    sos = signal.zpk2sos(*zpk)
-    return sos
+# ── Biquad Filter Design (RBJ Audio EQ Cookbook — digital coefficients) ─────
+# These formulas already produce digital b/a coeffs (w0 = 2πf/fs).
+# Convert to SOS with tf2sos — do NOT apply bilinear again.
 
 
 def design_low_shelf(
@@ -36,18 +23,17 @@ def design_low_shelf(
     w0 = 2.0 * np.pi * freq / fs
     A = 10.0 ** (gain_db / 40.0)
     alpha = np.sin(w0) / (2.0 * q)
+    cos_w0 = np.cos(w0)
+    sqrt_A = np.sqrt(A)
 
-    b = np.array([
-        A * ((A + 1) - (A - 1) * np.cos(w0) + 2 * np.sqrt(A) * alpha),
-        2 * A * ((A - 1) - (A + 1) * np.cos(w0)),
-        A * ((A + 1) - (A - 1) * np.cos(w0) - 2 * np.sqrt(A) * alpha),
-    ])
-    a = np.array([
-        (A + 1) + (A - 1) * np.cos(w0) + 2 * np.sqrt(A) * alpha,
-        -2 * ((A - 1) + (A + 1) * np.cos(w0)),
-        (A + 1) + (A - 1) * np.cos(w0) - 2 * np.sqrt(A) * alpha,
-    ])
-    return _design_biquad(b, a, fs)
+    b0 = A * ((A + 1) - (A - 1) * cos_w0 + 2 * sqrt_A * alpha)
+    b1 = 2 * A * ((A - 1) - (A + 1) * cos_w0)
+    b2 = A * ((A + 1) - (A - 1) * cos_w0 - 2 * sqrt_A * alpha)
+    a0 = (A + 1) + (A - 1) * cos_w0 + 2 * sqrt_A * alpha
+    a1 = -2 * ((A - 1) + (A + 1) * cos_w0)
+    a2 = (A + 1) - (A - 1) * cos_w0 - 2 * sqrt_A * alpha
+
+    return signal.tf2sos([b0, b1, b2], [a0, a1, a2])
 
 
 def design_peaking(
@@ -60,18 +46,16 @@ def design_peaking(
     w0 = 2.0 * np.pi * freq / fs
     A = 10.0 ** (gain_db / 40.0)
     alpha = np.sin(w0) / (2.0 * q)
+    cos_w0 = np.cos(w0)
 
-    b = np.array([
-        1 + alpha * A,
-        -2 * np.cos(w0),
-        1 - alpha * A,
-    ])
-    a = np.array([
-        1 + alpha / A,
-        -2 * np.cos(w0),
-        1 - alpha / A,
-    ])
-    return _design_biquad(b, a, fs)
+    b0 = 1 + alpha * A
+    b1 = -2 * cos_w0
+    b2 = 1 - alpha * A
+    a0 = 1 + alpha / A
+    a1 = -2 * cos_w0
+    a2 = 1 - alpha / A
+
+    return signal.tf2sos([b0, b1, b2], [a0, a1, a2])
 
 
 def design_high_shelf(
@@ -84,18 +68,17 @@ def design_high_shelf(
     w0 = 2.0 * np.pi * freq / fs
     A = 10.0 ** (gain_db / 40.0)
     alpha = np.sin(w0) / (2.0 * q)
+    cos_w0 = np.cos(w0)
+    sqrt_A = np.sqrt(A)
 
-    b = np.array([
-        A * ((A + 1) + (A - 1) * np.cos(w0) + 2 * np.sqrt(A) * alpha),
-        -2 * A * ((A - 1) + (A + 1) * np.cos(w0)),
-        A * ((A + 1) + (A - 1) * np.cos(w0) - 2 * np.sqrt(A) * alpha),
-    ])
-    a = np.array([
-        (A + 1) - (A - 1) * np.cos(w0) + 2 * np.sqrt(A) * alpha,
-        2 * ((A - 1) - (A + 1) * np.cos(w0)),
-        (A + 1) - (A - 1) * np.cos(w0) - 2 * np.sqrt(A) * alpha,
-    ])
-    return _design_biquad(b, a, fs)
+    b0 = A * ((A + 1) + (A - 1) * cos_w0 + 2 * sqrt_A * alpha)
+    b1 = -2 * A * ((A - 1) + (A + 1) * cos_w0)
+    b2 = A * ((A + 1) + (A - 1) * cos_w0 - 2 * sqrt_A * alpha)
+    a0 = (A + 1) - (A - 1) * cos_w0 + 2 * sqrt_A * alpha
+    a1 = 2 * ((A - 1) - (A + 1) * cos_w0)
+    a2 = (A + 1) - (A - 1) * cos_w0 - 2 * sqrt_A * alpha
+
+    return signal.tf2sos([b0, b1, b2], [a0, a1, a2])
 
 
 # ── EQ Pipeline ─────────────────────────────────────────────────────────────
@@ -118,11 +101,14 @@ class EQPipeline:
         fs: float = 96000.0,
     ) -> EQPipeline:
         """Pre-compute the cascaded SOS filters for given EQ settings."""
-        sos_low = design_low_shelf(freq=150.0, gain_db=bass_db, q=0.7, fs=fs)
-        sos_peak = design_peaking(freq=1000.0, gain_db=mid_db, q=1.0, fs=fs)
-        sos_high = design_high_shelf(freq=8000.0, gain_db=treble_db, q=0.7, fs=fs)
-        sos = np.vstack([sos_low, sos_peak, sos_high])
-        # zi per channel = n_sections × 2
+        # Bypass identity filter when all bands are flat (cheaper + no phase shift)
+        if bass_db == 0.0 and mid_db == 0.0 and treble_db == 0.0:
+            sos = np.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=np.float64)
+        else:
+            sos_low = design_low_shelf(freq=150.0, gain_db=bass_db, q=0.7, fs=fs)
+            sos_peak = design_peaking(freq=1000.0, gain_db=mid_db, q=1.0, fs=fs)
+            sos_high = design_high_shelf(freq=8000.0, gain_db=treble_db, q=0.7, fs=fs)
+            sos = np.vstack([sos_low, sos_peak, sos_high])
         n_sections = sos.shape[0]
         return cls(
             sos=sos,
@@ -140,9 +126,8 @@ class EQPipeline:
             out, self.zi_per_channel[0] = signal.sosfilt(
                 self.sos, samples, zi=self.zi_per_channel[0]
             )
-            return out
+            return out.astype(np.float32, copy=False)
         else:
-            # Deinterleave stereo, filter each channel, re-interleave
             left = samples[0::2]
             right = samples[1::2]
             left_out, self.zi_per_channel[0] = signal.sosfilt(
@@ -165,8 +150,7 @@ def parse_replaygain_db(tag_str: str | None) -> float:
     if tag_str is None:
         return 0.0
     try:
-        # Strip ' dB' suffix
-        return float(str(tag_str).replace(" dB", "").strip())
+        return float(str(tag_str).replace(" dB", "").replace("db", "").strip())
     except (ValueError, AttributeError):
         return 0.0
 
@@ -179,33 +163,41 @@ def apply_replaygain(
     if gain_db == 0.0:
         return samples
     linear = 10.0 ** (gain_db / 20.0)
-    # Use in-place multiplication for speed
     np.multiply(samples, linear, out=samples)
     return samples
 
 
-# ── TPDF Dithering ──────────────────────────────────────────────────────────
+# ── Soft clip / output ──────────────────────────────────────────────────────
+
+
+def soft_clip_float32(samples: np.ndarray) -> np.ndarray:
+    """Clamp float32 samples to [-1, 1] with a soft knee near the rails.
+
+    Keeps output in FLOAT32 device format (no int16 quantization).
+    Soft clip prevents hard digital clipping when EQ/ReplayGain push peaks.
+    """
+    # tanh soft-clip only samples that would clip; leave the rest alone
+    abs_s = np.abs(samples)
+    mask = abs_s > 0.95
+    if np.any(mask):
+        out = samples.copy()
+        # Map overshoot into a gentle curve approaching ±1
+        over = out[mask]
+        sign = np.sign(over)
+        mag = np.abs(over)
+        # Blend linear → tanh beyond 0.95
+        t = (mag - 0.95) / 0.05  # 0 at 0.95, 1 at 1.0+
+        t = np.clip(t, 0.0, 1.0)
+        soft = np.tanh(mag)
+        out[mask] = sign * ((1.0 - t) * mag + t * soft)
+        return np.clip(out, -1.0, 1.0).astype(np.float32)
+    return np.clip(samples, -1.0, 1.0).astype(np.float32)
 
 
 def apply_tpdf_dither(samples: np.ndarray) -> np.ndarray:
-    """Apply Triangular PDF dither to float32 audio, returning int16.
+    """Legacy helper: soft-clip float32 for device output.
 
-    TPDF = sum of two uniform random variables, giving a triangular
-    distribution with ±1 LSB range — eliminates harmonic distortion
-    from quantization while adding only constant-noise-floor hiss.
+    Kept for import compatibility. Device is FLOAT32 so we no longer
+    quantize to int16 (that was a format mismatch bug).
     """
-    scale = 32767.0
-    scaled = samples * scale
-
-    # Two independent uniform distributions [−0.5, 0.5)
-    rng = np.random.default_rng()
-    noise1 = rng.random(len(scaled), dtype=np.float32) - 0.5
-    noise2 = rng.random(len(scaled), dtype=np.float32) - 0.5
-
-    tpdf_noise = noise1 + noise2  # triangular, range [−1.0, 1.0) LSB
-
-    dithered = np.round(scaled + tpdf_noise)
-    return np.clip(dithered, -32768, 32767).astype(np.int16)
-
-
-
+    return soft_clip_float32(samples)

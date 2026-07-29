@@ -10,16 +10,17 @@ from typing import Optional, Tuple
 import miniaudio
 import numpy as np
 
-from musicli.dsp import EQPipeline, apply_tpdf_dither
+from musicli.dsp import EQPipeline, soft_clip_float32
 
 logger = logging.getLogger(__name__)
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
-TARGET_SAMPLE_RATE = 96000
+TARGET_SAMPLE_RATE = 48000  # more practical than 96k for realtime CLI
 CHANNELS = 2
-BUFFER_FRAMES = 1024  # frames per callback invocation
-CROSSFADE_FRAMES = 2000  # ~21ms crossfade duration at 96kHz
+BYTES_PER_SAMPLE = 4  # float32
+BUFFER_FRAMES = 1024
+CROSSFADE_FRAMES = 2000  # ~42ms at 48kHz
 
 
 # ── Engine ──────────────────────────────────────────────────────────────────
@@ -36,17 +37,17 @@ class AudioEngine:
 
     def __init__(self) -> None:
         self._device: Optional[miniaudio.PlaybackDevice] = None
-        self._current_decoder: Optional[miniaudio.Decoder] = None
-        self._next_decoder: Optional[miniaudio.Decoder] = None
+        self._current_decoder: Optional[miniaudio.DecodedSoundFile] = None
+        self._next_decoder: Optional[miniaudio.DecodedSoundFile] = None
         self._next_path: str = ""
         self._next_replaygain_db: float = 0.0
         self._next_duration: float = 0.0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         # ── Playback state ──────────────────────────────────────────────
         self._playing = False
         self._paused = False
-        self._volume: float = 0.8  # linear, 0.0–1.0
+        self._volume: float = 0.8
         self._muted: bool = False
 
         # ── DSP state ───────────────────────────────────────────────────
@@ -56,23 +57,27 @@ class AudioEngine:
         # ── Crossfade state ───────────────────────────────────────────
         self._crossfade_enabled: bool = True
         self._crossfade_remaining: int = 0
-        # Ring buffer holding the last CROSSFADE_FRAMES samples (interleaved)
         self._tail_buffer = np.zeros(CROSSFADE_FRAMES * CHANNELS, dtype=np.float32)
-        self._tail_write: int = 0  # current write position in ring buffer
+        self._tail_write: int = 0
 
         # ── Track info ──────────────────────────────────────────────────
         self._current_path: str = ""
         self._duration: float = 0.0
-        self._position_callback_frame: float = 0.0  # updated in callback
+        self._position_sec: float = 0.0
 
         # ── Auto-switch notification (gapless) ─────────────────────────
         self._just_switched: bool = False
         self._switched_to_path: str = ""
 
         # ── FFT / visualiser data ──────────────────────────────────────
-        # Shared buffer: last frame of float32 audio for the UI to FFT
         self._fft_buffer = np.zeros(BUFFER_FRAMES * CHANNELS, dtype=np.float32)
         self._fft_lock = threading.Lock()
+
+        # ── Decoded sample cursor (for DecodedSoundFile which is not a stream) ─
+        self._sample_pos: int = 0  # index into interleaved float samples
+        self._samples: Optional[np.ndarray] = None
+        self._next_samples: Optional[np.ndarray] = None
+        self._next_sample_pos: int = 0
 
     # ── Public properties ─────────────────────────────────────────────────
 
@@ -94,9 +99,9 @@ class AudioEngine:
 
     @property
     def position(self) -> float:
-        """Current playback position in seconds (from callback)."""
+        """Current playback position in seconds."""
         with self._lock:
-            return self._position_callback_frame
+            return self._position_sec
 
     @property
     def volume(self) -> float:
@@ -105,14 +110,9 @@ class AudioEngine:
     # ── FFT data access ──────────────────────────────────────────────────
 
     def get_fft_data(self) -> np.ndarray:
-        """Return a copy of the last audio frame for FFT visualisation.
-
-        Returns a mono float32 array of `BUFFER_FRAMES` samples (averaged
-        L+R), suitable for `np.fft.rfft`.
-        """
+        """Return mono float32 array of last frame for FFT visualisation."""
         with self._fft_lock:
             frame = self._fft_buffer.copy()
-        # Convert stereo interleaved → mono
         mono = (frame[0::2] + frame[1::2]) * 0.5
         return mono
 
@@ -120,69 +120,76 @@ class AudioEngine:
         """Return left and right channels separately for stereo FFT."""
         with self._fft_lock:
             frame = self._fft_buffer.copy()
-        left = frame[0::2].copy()
-        right = frame[1::2].copy()
-        return left, right
+        return frame[0::2].copy(), frame[1::2].copy()
 
     # ── Track loading ────────────────────────────────────────────────────
+
+    def _decode_file(self, path: str) -> Tuple[np.ndarray, float]:
+        """Decode an audio file to interleaved float32 stereo at target rate.
+
+        Returns (samples, duration_seconds).
+        """
+        decoded = miniaudio.decode_file(
+            path,
+            output_format=miniaudio.SampleFormat.FLOAT32,
+            nchannels=CHANNELS,
+            sample_rate=TARGET_SAMPLE_RATE,
+        )
+        # decoded.samples is array.array or bytes-like of float32
+        samples = np.frombuffer(decoded.samples, dtype=np.float32).copy()
+        # Ensure even length (complete frames)
+        if len(samples) % CHANNELS:
+            samples = samples[: len(samples) - (len(samples) % CHANNELS)]
+        duration = len(samples) / (TARGET_SAMPLE_RATE * CHANNELS)
+        return samples, duration
 
     def load_track(self, path: str) -> bool:
         """Load an audio file for playback. Returns True on success."""
         try:
-            decoder = miniaudio.decode_file(
-                path,
-                output_format=miniaudio.SampleFormat.FLOAT32,
-                nchannels=CHANNELS,
-                sample_rate=TARGET_SAMPLE_RATE,
-            )
+            samples, duration = self._decode_file(path)
         except Exception as exc:
             logger.error("Failed to decode %s: %s", path, exc)
             return False
 
         with self._lock:
-            self._current_decoder = decoder
+            self._samples = samples
+            self._sample_pos = 0
             self._current_path = path
-            self._duration = decoder.duration
-            self._position_callback_frame = 0.0
-            # Clear stale preloaded next track and crossfade state
-            self._next_decoder = None
+            self._duration = duration
+            self._position_sec = 0.0
+            self._next_samples = None
+            self._next_sample_pos = 0
             self._next_path = ""
             self._next_replaygain_db = 0.0
+            self._next_duration = 0.0
             self._crossfade_remaining = 0
             self._tail_write = 0
+            self._current_decoder = None  # unused; kept for API compat
+            self._next_decoder = None
 
         logger.info(
             "Loaded: %s (%.1fs, %d Hz, %d ch)",
             Path(path).name,
-            decoder.duration,
-            decoder.sample_rate,
-            decoder.nchannels,
+            duration,
+            TARGET_SAMPLE_RATE,
+            CHANNELS,
         )
         return True
 
     def preload_next(self, path: str, replaygain_db: float = 0.0) -> bool:
-        """Pre-decode the next track for gapless playback.
-
-        Call this after `load_track()` with the path of the track that
-        should play next. The callback will auto-switch when the current
-        decoder runs dry.
-        """
+        """Pre-decode the next track for gapless playback."""
         try:
-            decoder = miniaudio.decode_file(
-                path,
-                output_format=miniaudio.SampleFormat.FLOAT32,
-                nchannels=CHANNELS,
-                sample_rate=TARGET_SAMPLE_RATE,
-            )
+            samples, duration = self._decode_file(path)
         except Exception as exc:
             logger.debug("Failed to preload %s: %s", path, exc)
             return False
 
         with self._lock:
-            self._next_decoder = decoder
+            self._next_samples = samples
+            self._next_sample_pos = 0
             self._next_path = path
             self._next_replaygain_db = replaygain_db
-            self._next_duration = decoder.duration
+            self._next_duration = duration
 
         logger.debug("Preloaded next: %s", Path(path).name)
         return True
@@ -190,8 +197,7 @@ class AudioEngine:
     def has_just_switched(self) -> Tuple[bool, str]:
         """Check if the callback auto-switched to a preloaded track.
 
-        Returns (switched, path). Reading this clears the flag so each
-        switch is only reported once.
+        Returns (switched, path). Reading this clears the flag.
         """
         with self._lock:
             switched = self._just_switched
@@ -214,35 +220,48 @@ class AudioEngine:
         self._paused = not self._paused
         logger.debug("Paused: %s", self._paused)
 
+    def resume(self) -> None:
+        """Resume if paused; start if stopped with a loaded track."""
+        if self._samples is None:
+            return
+        if self._device is None or not self._device.running:
+            self._start_device()
+        self._playing = True
+        self._paused = False
+
     def stop(self) -> None:
         """Stop playback and release device."""
         self._playing = False
         self._paused = False
         with self._lock:
-            self._next_decoder = None
+            self._next_samples = None
             self._next_path = ""
             self._next_duration = 0.0
             self._crossfade_remaining = 0
             self._tail_write = 0
+            self._position_sec = 0.0
         if self._device and self._device.running:
-            self._device.stop()
-            self._device.close()
+            try:
+                self._device.stop()
+                self._device.close()
+            except Exception:
+                pass
             self._device = None
 
     def seek(self, seconds: float) -> None:
         """Seek to an absolute position in seconds."""
         with self._lock:
-            if self._current_decoder:
-                try:
-                    self._current_decoder.seek(int(seconds * TARGET_SAMPLE_RATE))
-                    self._position_callback_frame = seconds
-                    # Reset EQ filter state after seek to avoid transients
-                    n_sections = self._eq.sos.shape[0]
-                    self._eq.zi_per_channel = [
-                        np.zeros((n_sections, 2)) for _ in range(2)
-                    ]
-                except Exception as exc:
-                    logger.warning("Seek failed: %s", exc)
+            if self._samples is None:
+                return
+            total_frames = len(self._samples) // CHANNELS
+            frame = int(max(0.0, min(seconds, self._duration)) * TARGET_SAMPLE_RATE)
+            frame = min(frame, max(0, total_frames - 1))
+            self._sample_pos = frame * CHANNELS
+            self._position_sec = frame / TARGET_SAMPLE_RATE
+            n_sections = self._eq.sos.shape[0]
+            self._eq.zi_per_channel = [
+                np.zeros((n_sections, 2)) for _ in range(2)
+            ]
 
     def set_volume(self, vol: float) -> None:
         """Set volume 0.0–1.0 (linear)."""
@@ -252,14 +271,15 @@ class AudioEngine:
         self._muted = muted
 
     def set_eq(self, bass_db: float, mid_db: float, treble_db: float) -> None:
-        """Update EQ settings. Pre-computes new SOS coefficients outside
-        the audio callback so the hot path stays fast."""
-        self._eq = EQPipeline.create(
+        """Update EQ settings. Replaces pipeline under lock."""
+        new_eq = EQPipeline.create(
             bass_db=bass_db,
             mid_db=mid_db,
             treble_db=treble_db,
             fs=TARGET_SAMPLE_RATE,
         )
+        with self._lock:
+            self._eq = new_eq
 
     def set_replaygain(self, gain_db: float) -> None:
         """Set the ReplayGain value for the current track."""
@@ -270,40 +290,23 @@ class AudioEngine:
         self._crossfade_enabled = enabled
 
     def compute_rms_normalization(self) -> None:
-        """Compute on-the-fly RMS normalization gain when no ReplayGain
-        tags are available. Samples the first 5 seconds of the already-
-        loaded decoder for a fast RMS estimate."""
+        """Compute RMS normalization gain when no ReplayGain tags exist."""
         if self._replaygain_db != 0.0:
-            return  # Already have ReplayGain, skip
+            return
         with self._lock:
-            decoder = self._current_decoder
-        if decoder is None:
+            samples = self._samples
+        if samples is None or len(samples) == 0:
             return
         try:
-            # Read first 5 seconds (or whole track if shorter) from decoder
-            max_frames = int(5.0 * TARGET_SAMPLE_RATE)
-            total_frames = int(decoder.duration * TARGET_SAMPLE_RATE)
-            frames_to_read = min(max_frames, total_frames)
-
-            # Save current position, read the chunk, then seek back
-            saved_pos = self._position_callback_frame
-            with self._lock:
-                decoder.seek(0)
-                raw = decoder.read(frames_to_read)
-                decoder.seek(int(saved_pos * TARGET_SAMPLE_RATE))
-                self._position_callback_frame = saved_pos
-
-            if raw is None:
-                return
-            samples = np.frombuffer(raw, dtype=np.float32)
-            if len(samples) == 0:
-                return
-
-            # Compute RMS and target -18 dBFS (a common loudness target)
-            rms = np.sqrt(np.mean(samples ** 2))
-            if rms > 0:
-                target_rms = 10.0 ** (-18.0 / 20.0)  # -18 dBFS
+            # First ~5 seconds
+            max_samples = int(5.0 * TARGET_SAMPLE_RATE * CHANNELS)
+            chunk = samples[: min(max_samples, len(samples))]
+            rms = float(np.sqrt(np.mean(chunk ** 2)))
+            if rms > 1e-9:
+                target_rms = 10.0 ** (-18.0 / 20.0)
                 gain_db = 20.0 * np.log10(target_rms / rms)
+                # Clamp extreme gains
+                gain_db = max(-20.0, min(20.0, gain_db))
                 self._replaygain_db = gain_db
                 logger.info("RMS normalization: %.1f dB", gain_db)
         except Exception as exc:
@@ -314,9 +317,12 @@ class AudioEngine:
     def _start_device(self) -> None:
         """Create and start the miniaudio playback device."""
         if self._device:
-            if self._device.running:
-                self._device.stop()
-            self._device.close()
+            try:
+                if self._device.running:
+                    self._device.stop()
+                self._device.close()
+            except Exception:
+                pass
 
         self._device = miniaudio.PlaybackDevice(
             output_format=miniaudio.SampleFormat.FLOAT32,
@@ -324,166 +330,180 @@ class AudioEngine:
             sample_rate=TARGET_SAMPLE_RATE,
         )
         gen = self._callback_generator()
-        next(gen)  # prime the generator
+        next(gen)  # prime
         self._device.start(gen)
 
-    def _callback_generator(self):
-        """Generator-based audio callback for new miniaudio API.
+    def _read_frames(self, frame_count: int) -> Tuple[Optional[np.ndarray], bool]:
+        """Read frame_count frames from current sample buffer.
 
-        Uses the single-yield pattern: ``frame_count = yield output``.
-        Each ``.send(frame_count)`` call receives the frame count AND
-        yields the processed audio bytes in one step.
+        Returns (interleaved float32 samples or None if exhausted, ended).
         """
-        # Initial silence buffer to yield on the priming call
-        output = b"\x00" * (BUFFER_FRAMES * CHANNELS * 2)
+        if self._samples is None:
+            return None, True
+        needed = frame_count * CHANNELS
+        pos = self._sample_pos
+        end = len(self._samples)
+        if pos >= end:
+            return None, True
+        chunk = self._samples[pos : pos + needed]
+        self._sample_pos = pos + len(chunk)
+        ended = self._sample_pos >= end
+        if len(chunk) < needed:
+            pad = np.zeros(needed - len(chunk), dtype=np.float32)
+            chunk = np.concatenate([chunk, pad])
+        return chunk, ended
+
+    def _switch_to_next(self) -> bool:
+        """Switch to preloaded next track. Returns True if switched."""
+        if self._next_samples is None:
+            return False
+        do_crossfade = self._crossfade_enabled and self._tail_write > 0
+        if do_crossfade:
+            cf_frames = min(CROSSFADE_FRAMES, self._tail_write // CHANNELS)
+            self._crossfade_remaining = cf_frames
+        else:
+            self._crossfade_remaining = 0
+
+        self._samples = self._next_samples
+        self._sample_pos = 0
+        self._current_path = self._next_path
+        self._duration = self._next_duration
+        self._position_sec = 0.0
+        self._replaygain_db = self._next_replaygain_db
+        self._just_switched = True
+        self._switched_to_path = self._next_path
+
+        self._next_samples = None
+        self._next_sample_pos = 0
+        self._next_path = ""
+        self._next_duration = 0.0
+        self._next_replaygain_db = 0.0
+        self._tail_write = 0
+
+        n_sections = self._eq.sos.shape[0]
+        self._eq.zi_per_channel = [
+            np.zeros((n_sections, 2)) for _ in range(2)
+        ]
+        return True
+
+    def _callback_generator(self):
+        """Generator-based audio callback for miniaudio.
+        
+        Single-yield pattern:
+        1. First call to next(gen) primes it.
+        2. The driver calls .send(frame_count), which returns the value of the yield.
+        3. The generator resumes, calculates the NEXT output, and yields it.
+        """
+        # Initial priming buffer
+        current_output = b"\x00" * (BUFFER_FRAMES * CHANNELS * BYTES_PER_SAMPLE)
+        
         while True:
-            frame_count = yield output
-            needed = frame_count * CHANNELS
+            # The driver sends frame_count via .send()
+            frame_count = yield current_output
+            
+            # Handle edge cases where frame_count might be None or 0
+            if frame_count is None or frame_count <= 0:
+                frame_count = BUFFER_FRAMES
+                
+            needed_bytes = frame_count * CHANNELS * BYTES_PER_SAMPLE
 
             with self._lock:
-                decoder = self._current_decoder
                 paused = self._paused
+                playing = self._playing
+                samples_loaded = self._samples is not None
 
-            if decoder is None or paused:
-                self._crossfade_remaining = 0
-                self._tail_write = 0
-                output = b"\x00" * (needed * 2)
+            if not playing or paused or not samples_loaded:
+                current_output = b"\x00" * needed_bytes
                 continue
 
-            # ── Read decoded float32 samples ────────────────────────────
-            try:
-                with self._lock:
-                    result = decoder.read(frame_count)
-            except Exception:
-                output = b"\x00" * (needed * 2)
-                continue
+            with self._lock:
+                chunk, ended = self._read_frames(frame_count)
+                switched = False
+                tail_for_blend: Optional[np.ndarray] = None
 
-            switched_this_call = False
-
-            if result is None:
-                # Track finished — try auto-switch to preloaded next
-                with self._lock:
-                    next_dec = self._next_decoder
-                    next_path = self._next_path
-                    next_rg = self._next_replaygain_db
-                    next_duration = self._next_duration
-
-                if next_dec is not None:
-                    do_crossfade = self._crossfade_enabled and self._tail_write > 0
-                    if do_crossfade:
-                        cf_frames = min(CROSSFADE_FRAMES,
-                                        self._tail_write // CHANNELS)
-                        cf_len = cf_frames * CHANNELS
-                        tail = np.zeros(cf_len, dtype=np.float32)
-                        src_end = self._tail_write
-                        src_start = max(0, src_end - cf_len)
-                        tail[:cf_len] = self._tail_buffer[src_start:src_end]
-                        self._crossfade_remaining = cf_frames
+                if chunk is None or (ended and self._sample_pos >= len(self._samples or [])):
+                    if self._next_samples is not None:
+                        if self._crossfade_enabled and self._tail_write > 0:
+                            cf_frames = min(
+                                CROSSFADE_FRAMES, self._tail_write // CHANNELS
+                            )
+                            cf_len = cf_frames * CHANNELS
+                            src_end = self._tail_write
+                            src_start = max(0, src_end - cf_len)
+                            tail_for_blend = self._tail_buffer[src_start:src_end].copy()
+                        
+                        if self._switch_to_next():
+                            switched = True
+                            chunk, ended = self._read_frames(frame_count)
+                        else:
+                            self._playing = False
+                            current_output = b"\x00" * needed_bytes
+                            continue
                     else:
-                        self._crossfade_remaining = 0
-                    self._tail_write = 0
-
-                    # Gapless switch
-                    with self._lock:
-                        self._current_decoder = next_dec
-                        self._current_path = next_path
-                        self._next_decoder = None
-                        self._next_path = ""
-                        self._replaygain_db = next_rg
-                        self._duration = next_duration
-                        self._position_callback_frame = 0.0
-                        self._just_switched = True
-                        self._switched_to_path = next_path
-                        n_sections = self._eq.sos.shape[0]
-                        self._eq.zi_per_channel = [
-                            np.zeros((n_sections, 2)) for _ in range(2)
-                        ]
-                        decoder = self._current_decoder
-
-                    try:
-                        with self._lock:
-                            result = decoder.read(frame_count)
-                    except Exception:
-                        output = b"\x00" * (needed * 2)
+                        self._playing = False
+                        current_output = b"\x00" * needed_bytes
                         continue
 
-                    # ── Apply crossfade blend ───────────────────────────
-                    if do_crossfade and self._crossfade_remaining > 0 and result is not None:
-                        new_samples = np.frombuffer(result, dtype=np.float32)
-                        actual_frames = len(new_samples) // CHANNELS
-                        blend_frames = min(actual_frames, self._crossfade_remaining)
-                        blend_len = blend_frames * CHANNELS
-                        ramp = np.linspace(0.0, 1.0, blend_frames, dtype=np.float32)
-                        ramp_stereo = np.repeat(ramp, CHANNELS)
-                        result_bytes = bytearray(result)
-                        new_view = np.frombuffer(result_bytes, dtype=np.float32)
-                        if blend_len <= len(tail):
-                            new_view[:blend_len] = (
-                                tail[:blend_len] * (1.0 - ramp_stereo)
-                                + new_view[:blend_len] * ramp_stereo
-                            )
-                        result = bytes(result_bytes)
-                        self._crossfade_remaining -= blend_frames
-
-                    switched_this_call = True
-                else:
+                if chunk is None:
                     self._playing = False
-                    self._crossfade_remaining = 0
-                    output = b"\x00" * (needed * 2)
+                    current_output = b"\x00" * needed_bytes
                     continue
 
-            if result is None:
-                self._playing = False
-                self._crossfade_remaining = 0
-                output = b"\x00" * (needed * 2)
-                continue
+                # Crossfade blend
+                if switched and tail_for_blend is not None and self._crossfade_remaining > 0:
+                    actual_frames = len(chunk) // CHANNELS
+                    blend_frames = min(actual_frames, self._crossfade_remaining)
+                    blend_len = blend_frames * CHANNELS
+                    if blend_len > 0 and len(tail_for_blend) >= blend_len:
+                        ramp = np.linspace(0.0, 1.0, blend_frames, dtype=np.float32)
+                        ramp_stereo = np.repeat(ramp, CHANNELS)
+                        chunk = chunk.copy()
+                        chunk[:blend_len] = (
+                            tail_for_blend[:blend_len] * (1.0 - ramp_stereo)
+                            + chunk[:blend_len] * ramp_stereo
+                        )
+                        self._crossfade_remaining -= blend_frames
 
-            samples = np.frombuffer(result, dtype=np.float32).copy()
+                # Update tail ring
+                if not switched:
+                    samples_len = len(chunk)
+                    tail_buf = self._tail_buffer
+                    tail_len = len(tail_buf)
+                    if samples_len >= tail_len:
+                        tail_buf[:] = chunk[-tail_len:]
+                        self._tail_write = tail_len
+                    else:
+                        w = self._tail_write
+                        remaining = tail_len - w
+                        if samples_len <= remaining:
+                            tail_buf[w : w + samples_len] = chunk
+                            self._tail_write = w + samples_len
+                        else:
+                            tail_buf[w:] = chunk[:remaining]
+                            overflow = samples_len - remaining
+                            tail_buf[:overflow] = chunk[remaining:]
+                            self._tail_write = overflow
 
-            # Pad with silence if we got fewer frames
-            actual_frames = len(samples) // CHANNELS
-            if actual_frames < frame_count:
-                pad = np.zeros((frame_count - actual_frames) * CHANNELS, dtype=np.float32)
-                samples = np.concatenate([samples, pad])
-                if not switched_this_call:
-                    with self._lock:
-                        next_dec = self._next_decoder
-                    if next_dec is None:
-                        self._playing = False
+                actual_frames = len(chunk) // CHANNELS
+                self._position_sec = self._sample_pos / (TARGET_SAMPLE_RATE * CHANNELS)
 
-            # ── Update tail buffer (ring buffer) ────────────────────────
-            if not switched_this_call:
-                samples_len = len(samples)
-                tail_buf = self._tail_buffer
-                tail_len = len(tail_buf)
-                w = self._tail_write
-                remaining = tail_len - w
-                if samples_len <= remaining:
-                    tail_buf[w:w + samples_len] = samples
-                    self._tail_write = w + samples_len
-                else:
-                    tail_buf[w:] = samples[:remaining]
-                    overflow = samples_len - remaining
-                    tail_buf[:overflow] = samples[remaining:]
-                    self._tail_write = overflow
+                with self._fft_lock:
+                    n = min(len(chunk), len(self._fft_buffer))
+                    self._fft_buffer[:n] = chunk[:n]
+                    if n < len(self._fft_buffer):
+                        self._fft_buffer[n:] = 0
 
-            # ── Update position ─────────────────────────────────────────
-            with self._lock:
-                self._position_callback_frame += actual_frames / TARGET_SAMPLE_RATE
+                # DSP
+                out = chunk.astype(np.float32, copy=True)
+                if self._replaygain_db != 0.0:
+                    linear = 10.0 ** (self._replaygain_db / 20.0)
+                    np.multiply(out, linear, out=out)
 
-            # ── Copy to FFT buffer (thread-safe) ────────────────────────
-            with self._fft_lock:
-                self._fft_buffer[: len(samples)] = samples
+                out = self._eq.process(out, CHANNELS)
 
-            # ── DSP Pipeline (all numpy) ────────────────────────────────
-            if self._replaygain_db != 0.0:
-                linear = 10.0 ** (self._replaygain_db / 20.0)
-                np.multiply(samples, linear, out=samples)
+                vol = 0.0 if self._muted else self._volume
+                if vol != 1.0:
+                    np.multiply(out, vol, out=out)
 
-            samples = self._eq.process(samples, CHANNELS)
-
-            vol = 0.0 if self._muted else self._volume
-            if vol != 1.0:
-                np.multiply(samples, vol, out=samples)
-
-            output = apply_tpdf_dither(samples).tobytes()
+                out = soft_clip_float32(out)
+                current_output = out.tobytes()

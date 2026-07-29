@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, List
 
 import mutagen
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3
 from mutagen.mp3 import MP3
 from mutagen.wave import WAVE
 
@@ -17,44 +15,41 @@ from musicli.state import TrackMeta, save_cache, load_cache
 
 logger = logging.getLogger(__name__)
 
-# Supported extensions
-SUPPORTED_EXTS = {".mp3", ".flac", ".wav"}
+SUPPORTED_EXTS = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".aac", ".opus"}
 
-
-# ── Metadata extraction ─────────────────────────────────────────────────────
+# Skip these directory names while walking
+_SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__",
+    ".venv", "venv", "dist", "build", ".tox",
+}
 
 
 def _extract_metadata(filepath: Path) -> TrackMeta:
-    """Extract Artist, Album, Title, Track#, Duration, ReplayGain from a
-    file. Falls back to filename parsing when tags are missing."""
-    meta = TrackMeta(path=str(filepath))
+    """Extract Artist, Album, Title, Track#, Duration, ReplayGain from a file."""
+    meta = TrackMeta(path=str(filepath.resolve()))
     filename = filepath.stem
 
     try:
-        audio = mutagen.File(str(filepath))
+        audio = mutagen.File(str(filepath), easy=False)
     except Exception:
-        # Can't read at all — fall back entirely to filename
         return _fallback_filename(meta, filename)
 
     if audio is None:
         return _fallback_filename(meta, filename)
 
-    # ── Duration ────────────────────────────────────────────────────────
     try:
-        meta.duration = audio.info.length
+        meta.duration = float(getattr(audio.info, "length", 0.0) or 0.0)
     except Exception:
         meta.duration = 0.0
 
-    # ── Tags ────────────────────────────────────────────────────────────
     artist: str | None = None
     album: str | None = None
     title: str | None = None
     track_num: int = 0
-    rg_track: float | None = None
-    rg_album: float | None = None
+    rg_track: str | None = None
+    rg_album: str | None = None
 
-    if isinstance(audio, (MP3, WAVE)):
-        # ID3 tags
+    if isinstance(audio, MP3) or (audio.tags and hasattr(audio.tags, "getall")):
         tags = audio.tags if audio.tags else {}
         artist = _id3_text(tags, "TPE1")
         album = _id3_text(tags, "TALB")
@@ -62,24 +57,42 @@ def _extract_metadata(filepath: Path) -> TrackMeta:
         tn = _id3_text(tags, "TRCK")
         if tn:
             track_num = _parse_track_number(tn)
-
-        # ReplayGain in TXXX frames
         rg_track = _id3_txxx(tags, "REPLAYGAIN_TRACK_GAIN")
         rg_album = _id3_txxx(tags, "REPLAYGAIN_ALBUM_GAIN")
 
-    elif isinstance(audio, FLAC):
-        # Vorbis comments
-        artist = _vc_first(audio, "artist")
-        album = _vc_first(audio, "album")
-        title = _vc_first(audio, "title")
-        tn = _vc_first(audio, "tracknumber")
-        if tn:
-            track_num = _parse_track_number(tn)
+    if isinstance(audio, FLAC) or (hasattr(audio, "get") and not artist):
+        try:
+            artist = artist or _vc_first(audio, "artist")
+            album = album or _vc_first(audio, "album")
+            title = title or _vc_first(audio, "title")
+            tn = _vc_first(audio, "tracknumber")
+            if tn and not track_num:
+                track_num = _parse_track_number(tn)
+            rg_track = rg_track or _vc_first(audio, "replaygain_track_gain")
+            rg_album = rg_album or _vc_first(audio, "replaygain_album_gain")
+        except Exception:
+            pass
 
-        rg_track = _vc_first(audio, "replaygain_track_gain")
-        rg_album = _vc_first(audio, "replaygain_album_gain")
+    # MP4 / M4A
+    if not artist and hasattr(audio, "tags") and audio.tags:
+        try:
+            tags = audio.tags
+            if "\xa9ART" in tags:
+                artist = str(tags["\xa9ART"][0])
+            if "\xa9alb" in tags:
+                album = str(tags["\xa9alb"][0])
+            if "\xa9nam" in tags:
+                title = str(tags["\xa9nam"][0])
+            if "trkn" in tags:
+                tr = tags["trkn"][0]
+                track_num = int(tr[0]) if tr else 0
+        except Exception:
+            pass
 
-    # Apply or fallback
+    if isinstance(audio, WAVE) and not title:
+        # WAVE rarely has tags; filename fallback below
+        pass
+
     meta.artist = artist or "Unknown Artist"
     meta.album = album or "Unknown Album"
     meta.title = title or filename
@@ -100,70 +113,91 @@ def _fallback_filename(meta: TrackMeta, filename: str) -> TrackMeta:
     return meta
 
 
-def _id3_text(tags: Dict[str, Any], key: str) -> str | None:
-    """Get the first text value of an ID3 frame."""
-    frame = tags.get(key)
-    if frame and hasattr(frame, "text") and frame.text:
-        return str(frame.text[0])
-    return None
-
-
-def _id3_txxx(tags: Dict[str, Any], desc: str) -> str | None:
-    """Get a TXXX (user-defined text) frame by description."""
-    for frame in tags.values():
-        if frame.FrameID == "TXXX" and frame.desc.lower() == desc.lower():
+def _id3_text(tags: Any, key: str) -> str | None:
+    try:
+        frame = tags.get(key) if hasattr(tags, "get") else None
+        if frame and hasattr(frame, "text") and frame.text:
             return str(frame.text[0])
+    except Exception:
+        pass
     return None
 
 
-def _vc_first(audio: FLAC, key: str) -> str | None:
-    """Get the first value of a Vorbis comment."""
-    vals = audio.get(key)
-    if vals:
-        return str(vals[0])
+def _id3_txxx(tags: Any, desc: str) -> str | None:
+    try:
+        values = tags.values() if hasattr(tags, "values") else []
+        for frame in values:
+            if (
+                getattr(frame, "FrameID", None) == "TXXX"
+                and getattr(frame, "desc", "").lower() == desc.lower()
+            ):
+                return str(frame.text[0])
+    except Exception:
+        pass
+    return None
+
+
+def _vc_first(audio: Any, key: str) -> str | None:
+    try:
+        vals = audio.get(key)
+        if vals:
+            return str(vals[0])
+    except Exception:
+        pass
     return None
 
 
 def _parse_track_number(tn: str) -> int:
-    """Parse '04' or '4/12' → int."""
     try:
-        return int(tn.split("/")[0].strip())
+        return int(str(tn).split("/")[0].strip())
     except (ValueError, AttributeError):
         return 0
 
 
-# ── Scanning ────────────────────────────────────────────────────────────────
+def _iter_audio_files(directory: Path) -> List[Path]:
+    """Recursively find supported audio files under directory."""
+    found: list[Path] = []
+    try:
+        for path in directory.rglob("*"):
+            if not path.is_file():
+                continue
+            # Skip hidden / excluded dirs in path
+            parts_lower = {p.lower() for p in path.parts}
+            if parts_lower & _SKIP_DIRS:
+                continue
+            if path.suffix.lower() in SUPPORTED_EXTS:
+                found.append(path)
+    except OSError as exc:
+        logger.warning("Scan error under %s: %s", directory, exc)
+    return found
 
 
 def scan_directory(
     directory: Path | None = None,
     force: bool = False,
 ) -> List[TrackMeta]:
-    """Scan directory for audio files, returning sorted TrackMeta list.
+    """Scan directory (recursively) for audio files, returning sorted TrackMeta list.
 
-    Uses a JSON cache to avoid re-reading tags every launch unless
-    `force=True`. The cache key is filepath → mtime.
+    Uses a JSON cache keyed by filepath → mtime unless `force=True`.
     """
-    directory = directory or Path.cwd()
+    directory = (directory or Path.cwd()).resolve()
     logger.info("Scanning %s for audio files...", directory)
 
-    # Load existing cache
     cache = load_cache()
     cache_map: Dict[str, Dict[str, Any]] = {
         c["path"]: c for c in cache if "path" in c
     }
 
     tracks: list[TrackMeta] = []
-    for filepath in directory.iterdir():
-        if filepath.suffix.lower() not in SUPPORTED_EXTS:
+    for filepath in _iter_audio_files(directory):
+        try:
+            mtime = filepath.stat().st_mtime
+        except OSError:
             continue
 
-        mtime = filepath.stat().st_mtime
-
-        # Check cache
-        cached = cache_map.get(str(filepath))
+        path_str = str(filepath.resolve())
+        cached = cache_map.get(path_str)
         if not force and cached and cached.get("_mtime") == mtime:
-            # Restore from cache
             meta = TrackMeta(
                 path=cached["path"],
                 artist=cached.get("artist", "Unknown Artist"),
@@ -177,12 +211,10 @@ def scan_directory(
             tracks.append(meta)
             continue
 
-        # Fresh extraction
         logger.debug("Reading metadata: %s", filepath.name)
         meta = _extract_metadata(filepath)
         tracks.append(meta)
 
-    # ── Sort: Artist → Album → Track# ──────────────────────────────────
     tracks.sort(key=lambda t: (
         t.artist.lower(),
         t.album.lower(),
@@ -190,7 +222,6 @@ def scan_directory(
         t.title.lower(),
     ))
 
-    # ── Save cache ──────────────────────────────────────────────────────
     cache_data: list[Dict[str, Any]] = []
     for t in tracks:
         entry: Dict[str, Any] = {

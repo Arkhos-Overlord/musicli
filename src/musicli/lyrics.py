@@ -5,19 +5,15 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from typing import Dict
+from typing import Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# ["]">] = one or more timestamps [mm:ss.xx] followed by lyric text
 _LRC_LINE_RE = re.compile(r"(\[\d{2}:\d{2}\.\d{2,3}\])+(.*)")
 
 
 def parse_lrc(lrc_text: str) -> Dict[float, str]:
-    """Parse an LRC-format string into {time_seconds: lyric_line}.
-
-    Supports multiple timestamps on one line (e.g. repeated chorus lines).
-    """
+    """Parse an LRC-format string into {time_seconds: lyric_line}."""
     lyrics: Dict[float, str] = {}
 
     for line in lrc_text.splitlines():
@@ -30,7 +26,6 @@ def parse_lrc(lrc_text: str) -> Dict[float, str]:
         if not text:
             continue
 
-        # Extract all timestamps from this line
         ts_re = re.compile(r"\[(\d{2}):(\d{2})\.(\d{2,3})\]")
         for ts_match in ts_re.finditer(line):
             minutes = int(ts_match.group(1))
@@ -43,31 +38,44 @@ def parse_lrc(lrc_text: str) -> Dict[float, str]:
     return lyrics
 
 
-# ── Background fetching ─────────────────────────────────────────────────────
-
-
 def fetch_lyrics_async(
     artist: str,
     title: str,
-    callback,
+    callback: Callable[[Dict[float, str]], None],
+    generation: int = 0,
+    generation_check: Optional[Callable[[], int]] = None,
 ) -> None:
-    """Fetch synced lyrics in a background thread; call `callback(lyrics_dict)`
-    on the main thread (or wherever safe)."""
+    """Fetch synced lyrics in a background thread.
+
+    If `generation_check` is provided, the callback is only invoked when
+    `generation_check() == generation` (drops stale results).
+    """
 
     def _worker() -> None:
         try:
-            query = f"{title} {artist}"
+            query = f"{title} {artist}".strip()
+            if not query or query == "Unknown Title Unknown Artist":
+                _safe_callback({})
+                return
             logger.info("Fetching lyrics: %s", query)
             lrc = _safe_search(query)
             if lrc:
                 parsed = parse_lrc(lrc)
                 logger.info("Got %d lyric lines.", len(parsed))
-                callback(parsed)
+                _safe_callback(parsed)
             else:
-                callback({})
+                _safe_callback({})
         except Exception as exc:
             logger.error("Lyrics fetch failed: %s", exc)
-            callback({})
+            _safe_callback({})
+
+    def _safe_callback(result: Dict[float, str]) -> None:
+        if generation_check is not None and generation_check() != generation:
+            return
+        try:
+            callback(result)
+        except Exception:
+            pass
 
     threading.Thread(target=_worker, daemon=True).start()
 

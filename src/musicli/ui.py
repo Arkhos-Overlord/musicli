@@ -1,6 +1,6 @@
 """Retro CRT/VGA terminal UI using rich: Layout, Live, Panel, box.DOUBLE.
 
-v2 — Adds cover art display, stereo VU meter, help overlay, and more themes.
+v3 — Fixed help overlay, cover art styles, library scroll + filter indices.
 """
 
 from __future__ import annotations
@@ -12,10 +12,11 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from rich import box
 from rich.align import Align
+from rich.columns import Columns
+from rich.console import Group
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 
 from musicli.state import TrackMeta
@@ -24,8 +25,12 @@ from musicli.themes import Theme, WAVEFORM_STYLES, WaveformStyle, DEFAULT_THEME
 logger = logging.getLogger(__name__)
 
 # ── Cover art size (in character cells) ─────────────────────────────────────
-COVER_WIDTH = 30
-COVER_HEIGHT = 15
+COVER_WIDTH = 28
+COVER_HEIGHT = 14
+
+# Visible library rows (scroll viewport)
+LIBRARY_VIEWPORT = 28
+
 
 # ── Platform-specific non-blocking input ────────────────────────────────────
 
@@ -94,25 +99,19 @@ def render_cover_art(
     width: int = COVER_WIDTH,
     height: int = COVER_HEIGHT,
 ) -> Optional[Text]:
-    """Convert album art (JPEG/PNG bytes) to an ANSI half-block Text object.
-
-    Each terminal row renders 2 image rows (upper/lower half) using ▄/▀/█
-    characters with foreground+background colour, achieving 2:1 pixel ratio.
-    Returns None if no image data or PIL unavailable.
-    """
+    """Convert album art (JPEG/PNG bytes) to an ANSI half-block Text object."""
     if img_bytes is None or len(img_bytes) < 100:
         return None
     try:
         from io import BytesIO
         from PIL import Image
         img = Image.open(BytesIO(img_bytes)).convert("RGB")
-        # Resize to (width, height * 2) because each terminal row = 2 pixel rows
         img = img.resize((width, height * 2), Image.LANCZOS)
         rgb = np.array(img, dtype=np.uint8)
     except Exception:
         return None
 
-    lines = []
+    lines: list[Text] = []
     for row in range(height):
         t = Text()
         for col in range(width):
@@ -144,7 +143,7 @@ def _progress_bar(
 
 
 def _format_time(seconds: float) -> str:
-    if seconds < 0:
+    if seconds < 0 or seconds != seconds:  # NaN guard
         seconds = 0
     m = int(seconds // 60)
     s = int(seconds % 60)
@@ -153,20 +152,36 @@ def _format_time(seconds: float) -> str:
 
 def _waveform_bar(value: float, style: WaveformStyle) -> str:
     chars = style.chars
-    idx = min(int(value * (len(chars) - 1)), len(chars) - 1)
+    if not chars:
+        return " "
+    idx = min(max(0, int(value * (len(chars) - 1))), len(chars) - 1)
     return chars[idx]
+
+
+def filter_tracks(tracks: List[TrackMeta], filter_text: str) -> List[Tuple[int, TrackMeta]]:
+    """Return (original_index, track) pairs matching the filter."""
+    if not filter_text:
+        return [(i, t) for i, t in enumerate(tracks)]
+    ft = filter_text.lower()
+    return [
+        (i, t) for i, t in enumerate(tracks)
+        if ft in t.title.lower()
+        or ft in t.artist.lower()
+        or ft in t.album.lower()
+    ]
 
 
 # ── Help Overlay ────────────────────────────────────────────────────────────
 
-HELP_TEXT = Text(""".──────────────────────────────────────────────────────.
+HELP_TEXT = Text.from_markup(
+    """[bold #00ff00].──────────────────────────────────────────────────────.
 │                   MUSICLI KEYS                   │
 ├──────────────────────────────────────────────────┤
-│  q / Esc      Quit                               │
+│  q / Esc      Quit (or clear search)             │
 │  ?            Toggle this help overlay            │
 │                                                  │
-│  j / ↑        Select previous track              │
-│  k / ↓        Select next track                  │
+│  k / ↑        Select previous track              │
+│  j / ↓        Select next track                  │
 │  Enter        Play selected track                 │
 │  Space        Play / Pause                       │
 │  n / p        Next / Previous track              │
@@ -179,18 +194,19 @@ HELP_TEXT = Text(""".───────────────────�
 │  2 / @        Mid +/-                           │
 │  3 / #        Treble +/-                        │
 │                                                  │
-│  /            Search filter                      │
+│  /            Start search filter                │
 │  a            Add current track to queue          │
 │  d            Remove from queue                   │
 │  [ / ]        Move queue item                    │
 │  x            Clear queue                        │
 │                                                  │
-│  r            Repeat mode (off → track → all)    │
+│  r            Repeat (off → track → album)       │
 │  s            Toggle shuffle                     │
 │  c            Toggle crossfade                   │
 │  t            Cycle theme                        │
 │  w            Cycle waveform style               │
-'──────────────────────────────────────────────────'""", style="bold #00ff00")
+'──────────────────────────────────────────────────'[/]"""
+)
 
 
 # ── Render helpers ──────────────────────────────────────────────────────────
@@ -203,58 +219,86 @@ def _render_library(
     theme: Theme,
     is_playing: bool,
     queue_indices: Optional[List[int]] = None,
+    viewport: int = LIBRARY_VIEWPORT,
+    search_active: bool = False,
 ) -> Panel:
-    """Render the library (left panel) with hierarchical Artist→Album→Track."""
-    if filter_text:
-        ft = filter_text.lower()
-        filtered = [
-            t for t in tracks
-            if ft in t.title.lower()
-            or ft in t.artist.lower()
-            or ft in t.album.lower()
-        ]
-    else:
-        filtered = tracks
-
+    """Render the library with scroll viewport and correct global indices."""
+    indexed = filter_tracks(tracks, filter_text)
     qset = set(queue_indices or [])
+
+    # Find highlight position within filtered list
+    highlight_pos = 0
+    for pos, (orig_i, _) in enumerate(indexed):
+        if orig_i == current_idx:
+            highlight_pos = pos
+            break
+    else:
+        # current_idx not in filter — clamp highlight
+        if indexed:
+            # Keep current_idx as-is; just scroll to top of filtered
+            highlight_pos = 0
+
+    # Scroll window so highlight stays visible
+    n = len(indexed)
+    if n <= viewport:
+        start, end = 0, n
+    else:
+        half = viewport // 2
+        start = max(0, highlight_pos - half)
+        end = start + viewport
+        if end > n:
+            end = n
+            start = max(0, end - viewport)
 
     lines: list[Text] = []
     last_artist = ""
     last_album = ""
+    visible = indexed[start:end]
 
-    for i, track in enumerate(filtered):
+    for orig_i, track in visible:
         if track.artist != last_artist:
-            lines.append(Text(f"\n{track.artist}", style=theme.accent))
+            lines.append(Text(f"{track.artist}", style=theme.accent))
             last_artist = track.artist
             last_album = ""
         if track.album != last_album and track.album != "Unknown Album":
             lines.append(Text(f"  {track.album}", style=theme.text_secondary))
             last_album = track.album
 
-        q_mark = "[Q] " if i in qset else ""
-        prefix = "▶ " if (i == current_idx and is_playing) else "  "
+        q_mark = "[Q] " if orig_i in qset else ""
+        prefix = "▶ " if (orig_i == current_idx and is_playing) else (
+            "▸ " if orig_i == current_idx else "  "
+        )
         tn = f"{track.track_num:02d}. " if track.track_num else ""
         dur = _format_time(track.duration)
 
         line = Text()
-        if q_mark and i != current_idx:
-            line.append(q_mark, style=theme.text_secondary)
-        if i == current_idx:
+        if orig_i == current_idx:
             line.append(f"{prefix}{q_mark}{tn}{track.title}", style=theme.accent)
         else:
             line.append(f"{prefix}{q_mark}{tn}{track.title}", style=theme.text_primary)
         line.append(f"  {dur}", style=theme.text_secondary)
         lines.append(line)
 
-    content = Text("\n").join(lines) if lines else Text(
-        "No tracks found.\nDrop .mp3/.flac/.wav files here.", style=theme.text_secondary
-    )
+    if start > 0:
+        lines.insert(0, Text(f"  ↑ {start} more…", style=theme.text_secondary))
+    if end < n:
+        lines.append(Text(f"  ↓ {n - end} more…", style=theme.text_secondary))
+
+    if not lines:
+        content: Text | Group = Text(
+            "No tracks found.\nDrop .mp3/.flac/.wav here\nor run from your music folder.",
+            style=theme.text_secondary,
+        )
+    else:
+        content = Text("\n").join(lines)
 
     title = "LIBRARY"
-    if filter_text:
-        title = f"LIBRARY [/{filter_text}]"
+    if search_active or filter_text:
+        title = f"LIBRARY [/{filter_text}█]" if search_active else f"LIBRARY [/{filter_text}]"
     if qset:
         title += f"  Q:{len(qset)}"
+    if n:
+        title += f"  ({n})"
 
     return Panel(
         content,
@@ -264,6 +308,14 @@ def _render_library(
         padding=(0, 1),
         style=f"on {theme.bg}",
     )
+
+
+def _eq_bar(val: float, label: str, width: int = 10) -> str:
+    val_c = max(-12.0, min(12.0, val))
+    ratio = (val_c + 12) / 24
+    filled = int(round(ratio * width))
+    bar = "─" * filled + " " * (width - filled)
+    return f"{label} [{bar}] {val:+.0f}dB"
 
 
 def _render_now_playing(
@@ -281,142 +333,110 @@ def _render_now_playing(
     shuffle: bool,
     cover_art: Optional[Text] = None,
 ) -> Panel:
-    """Render the Now Playing panel (top-right) with optional cover art."""
-    lines: list[Text] = []
-
+    """Render the Now Playing panel with optional cover art (styles preserved)."""
     if track is None:
-        lines.append(Text("No track loaded", style=theme.text_secondary))
         return Panel(
-            Text("\n").join(lines),
+            Text("No track loaded", style=theme.text_secondary),
             title="NOW PLAYING",
             border_style=theme.border,
             box=box.DOUBLE,
             padding=(0, 1),
+            style=f"on {theme.bg}",
         )
 
-    # ── Cover art (left) + track info (right) side by side ─────────────
-    if cover_art:
-        # Build info block
-        info_lines = Text()
-        info_lines.append(Text(f"{track.title}\n", style=theme.accent))
-        info_lines.append(Text(f"{track.artist}\n", style=theme.text_primary))
-        info_lines.append(Text(f"{track.album}\n", style=theme.text_secondary))
-        if track.track_num:
-            info_lines.append(Text(f"Track {track.track_num}\n", style=theme.text_secondary))
-        info_lines.append(Text("\n"))
+    info_parts: list[Text] = []
+    info_parts.append(Text(track.title, style=theme.accent))
+    info_parts.append(Text(f"{track.artist}  |  {track.album}", style=theme.text_primary))
+    if track.track_num:
+        info_parts.append(Text(f"Track {track.track_num}", style=theme.text_secondary))
+    info_parts.append(Text(""))
 
-        # Seek bar
-        pos_str = _format_time(position_sec)
-        dur_str = _format_time(duration)
-        bar = _progress_bar(position_sec, duration, width=30)
-        info_lines.append(Text(f"{pos_str} {bar} {dur_str}\n", style=theme.text_primary))
+    pos_str = _format_time(position_sec)
+    dur_str = _format_time(duration)
+    bar_w = 30 if cover_art else 40
+    bar = _progress_bar(position_sec, duration, width=bar_w)
+    info_parts.append(Text(f"{pos_str} {bar} {dur_str}", style=theme.text_primary))
+    info_parts.append(Text(""))
 
-        # Volume
-        vol_label = "MUTE" if muted else f"VOL {int(volume*100):d}%"
-        vol_bar = _progress_bar(0.0 if muted else volume, 1.0, width=15)
-        info_lines.append(Text(f"{vol_label} {vol_bar}\n", style=theme.text_primary))
+    vol_label = "MUTE" if muted else f"VOL {int(volume * 100):d}%"
+    vol_bar = _progress_bar(0.0 if muted else volume, 1.0, width=15 if cover_art else 20)
+    info_parts.append(Text(f"{vol_label} {vol_bar}", style=theme.text_primary))
 
-        # EQ
-        def _eq_bar(val: float, label: str, width: int = 10) -> str:
-            val_c = max(-12, min(12, val))
-            ratio = (val_c + 12) / 24
-            filled = int(round(ratio * width))
-            bar = "─" * filled + " " * (width - filled)
-            return f"{label} [{bar}] {val:+.0f}dB"
-        eq_line = f"{_eq_bar(eq_bass, 'B')}  {_eq_bar(eq_mid, 'M')}  {_eq_bar(eq_treble, 'T')}"
-        info_lines.append(Text(eq_line + "\n", style=theme.text_secondary))
+    eq_line = (
+        f"{_eq_bar(eq_bass, 'B', 8 if cover_art else 12)}  "
+        f"{_eq_bar(eq_mid, 'M', 8 if cover_art else 12)}  "
+        f"{_eq_bar(eq_treble, 'T', 8 if cover_art else 12)}"
+    )
+    info_parts.append(Text(eq_line, style=theme.text_secondary))
 
-        # Status flags
-        flags = []
-        if repeat_mode != "off":
-            flags.append(f"RPT:{repeat_mode[0].upper()}")
-        if shuffle:
-            flags.append("SHF")
-        if flags:
-            info_lines.append(Text(" | ".join(flags), style=theme.text_secondary))
+    flags = []
+    if repeat_mode != "off":
+        flags.append(f"RPT:{repeat_mode[:3].upper()}")
+    if shuffle:
+        flags.append("SHF")
+    if flags:
+        info_parts.append(Text(" | ".join(flags), style=theme.text_secondary))
 
-        # Combine cover art + info side by side
-        cover_lines = str(cover_art).split("\n")
-        info_str = str(info_lines).split("\n")
-        combined = Text()
-        max_rows = max(len(cover_lines), len(info_str))
-        for i in range(max_rows):
-            left = cover_lines[i] if i < len(cover_lines) else " " * COVER_WIDTH
-            right = info_str[i] if i < len(info_str) else ""
-            combined.append(Text(left))
-            combined.append(Text("  "))
-            combined.append(Text(right))
-            if i < max_rows - 1:
-                combined.append(Text("\n"))
-        lines.append(combined)
-    else:
-        # ── Track info (no cover art) ──────────────────────────────────────
-        lines.append(Text(f"{track.title}", style=theme.accent))
-        lines.append(Text(f"{track.artist}  |  {track.album}", style=theme.text_primary))
-        if track.track_num:
-            lines.append(Text(f"Track {track.track_num}", style=theme.text_secondary))
-        lines.append(Text(""))
-
-        # Seek bar
-        pos_str = _format_time(position_sec)
-        dur_str = _format_time(duration)
-        bar = _progress_bar(position_sec, duration, width=40)
-        lines.append(Text(f"{pos_str} {bar} {dur_str}", style=theme.text_primary))
-        lines.append(Text(""))
-
-        # Volume
-        vol_label = "MUTE" if muted else f"VOL {int(volume*100):d}%"
-        vol_bar = _progress_bar(0.0 if muted else volume, 1.0, width=20)
-        lines.append(Text(f"{vol_label} {vol_bar}", style=theme.text_primary))
-
-        # EQ
-        def _eq_bar2(val: float, label: str, width: int = 12) -> str:
-            val_c = max(-12, min(12, val))
-            ratio = (val_c + 12) / 24
-            filled = int(round(ratio * width))
-            bar = "─" * filled + " " * (width - filled)
-            return f"{label} [{bar}] {val:+.0f}dB"
-        eq_line = (
-            f"{_eq_bar2(eq_bass, 'B')}  "
-            f"{_eq_bar2(eq_mid, 'M')}  "
-            f"{_eq_bar2(eq_treble, 'T')}"
-        )
-        lines.append(Text(eq_line, style=theme.text_secondary))
-
-        # Status
-        flags = []
-        if repeat_mode != "off":
-            flags.append(f"RPT:{repeat_mode[0].upper()}")
-        if shuffle:
-            flags.append("SHF")
-        status = " | ".join(flags) if flags else ""
-        lines.append(Text(status, style=theme.text_secondary))
-
-    # ── Synced lyrics ──────────────────────────────────────────────────────
+    # Lyrics
     if lyrics:
-        lines.append(Text(""))
-        lines.append(Text("─" * 40, style=theme.text_secondary))
+        info_parts.append(Text(""))
+        info_parts.append(Text("─" * 36, style=theme.text_secondary))
         sorted_times = sorted(lyrics.keys())
         active_lyric = ""
         next_lyric = ""
         for t in sorted_times:
             if t <= position_sec:
                 active_lyric = lyrics[t]
-            elif next_lyric == "":
+            elif not next_lyric:
                 next_lyric = lyrics[t]
+                break
         if active_lyric:
-            lines.append(Text(f"  {active_lyric}", style=theme.accent_dim))
+            info_parts.append(Text(f"  {active_lyric}", style=theme.accent_dim))
         if next_lyric:
-            lines.append(Text(f"\u258c {next_lyric}", style=theme.accent))
+            info_parts.append(Text(f"▌ {next_lyric}", style=theme.accent))
+
+    info_block = Text("\n").join(info_parts)
+
+    if cover_art is not None:
+        # Preserve cover art styles via Columns (no str() conversion)
+        body: Group | Text | Columns = Columns(
+            [cover_art, info_block],
+            equal=False,
+            expand=True,
+            padding=(0, 2),
+        )
+    else:
+        body = info_block
 
     return Panel(
-        Text("\n").join(lines),
+        body,
         title="NOW PLAYING",
         border_style=theme.border,
         box=box.DOUBLE,
         padding=(0, 1),
         style=f"on {theme.bg}",
     )
+
+
+def _spectrum_bars(channel: np.ndarray, n_bars: int = 16) -> str:
+    fft = np.abs(np.fft.rfft(channel.astype(np.float64)))
+    if len(fft) == 0:
+        return "▁" * n_bars
+    band_size = max(1, len(fft) // n_bars)
+    bands = np.zeros(n_bars)
+    for i in range(n_bars):
+        start = i * band_size
+        end = start + band_size
+        bands[i] = np.mean(fft[start:end]) if start < len(fft) else 0
+    bmax = bands.max()
+    if bmax > 0:
+        bands /= bmax
+    bar_chars = "▁▂▃▄▅▆▇█"
+    out = ""
+    for b in bands:
+        idx = min(int(b * 7), 7)
+        out += bar_chars[idx]
+    return out
 
 
 def _render_visualizer(
@@ -428,85 +448,46 @@ def _render_visualizer(
     waveform_style: WaveformStyle,
     fft_stereo: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> Panel:
-    """Render the visualizer panel: stereo VU bars + waveform + position."""
+    """Render stereo VU bars + waveform + position marker."""
     lines: list[Text] = []
 
-    # ── Stereo VU Meter ──────────────────────────────────────────────────
     if fft_stereo is not None:
-        left_ch, right_ch = fft_stereo
         try:
-            def _spectrum_bars(channel: np.ndarray, n_bars: int = 16) -> str:
-                fft = np.abs(np.fft.rfft(channel))
-                band_size = max(1, len(fft) // n_bars)
-                bands = np.zeros(n_bars)
-                for i in range(n_bars):
-                    start = i * band_size
-                    end = start + band_size
-                    bands[i] = np.mean(fft[start:end]) if end <= len(fft) else 0
-                bmax = bands.max()
-                if bmax > 0:
-                    bands /= bmax
-                bar_chars = "▁▂▃▄▅▆▇█"
-                out = ""
-                for b in bands:
-                    idx = min(int(b * 7), 7)
-                    out += bar_chars[idx]
-                return out
-
+            left_ch, right_ch = fft_stereo
             left_bars = _spectrum_bars(left_ch, 16)
             right_bars = _spectrum_bars(right_ch, 16)
-
             vu = Text()
             vu.append(" L ", style=theme.accent)
-            vu.append(Text(left_bars, style=theme.viz_colors[0]))
-            vu.append(Text("\n"))
+            color0 = theme.viz_colors[0] if theme.viz_colors else theme.accent
+            color1 = theme.viz_colors[1] if len(theme.viz_colors) > 1 else theme.accent
+            vu.append(left_bars, style=color0)
+            vu.append("\n")
             vu.append(" R ", style=theme.accent)
-            vu.append(Text(right_bars, style=theme.viz_colors[1]))
+            vu.append(right_bars, style=color1)
             lines.append(vu)
             lines.append(Text(""))
         except Exception:
             pass
-
-    # ── Fallback mono VU ─────────────────────────────────────────────────
     elif fft_data is not None and len(fft_data) > 0:
         try:
-            fft = np.abs(np.fft.rfft(fft_data))
-            n_bins = 8
-            band_size = max(1, len(fft) // n_bins)
-            bands = np.zeros(n_bins)
-            for i in range(n_bins):
-                start = i * band_size
-                end = start + band_size
-                bands[i] = np.mean(fft[start:end]) if end <= len(fft) else 0
-            bmax = bands.max()
-            if bmax > 0:
-                bands /= bmax
-            bar_chars = "▁▂▃▄▅▆▇█"
-            viz = ""
-            for b in bands:
-                idx = min(int(b * 7), 7)
-                viz += bar_chars[idx] * 2
-            lines.append(Text(viz, style=theme.accent))
+            viz = _spectrum_bars(fft_data, 8)
+            # Widen mono bars
+            lines.append(Text("".join(c * 2 for c in viz), style=theme.accent))
             lines.append(Text(""))
         except Exception:
             pass
 
-    # ── Waveform ────────────────────────────────────────────────────────
     if waveform_peaks is not None and len(waveform_peaks) > 0:
-        wf_line = ""
-        for peak in waveform_peaks:
-            wf_line += _waveform_bar(float(peak), waveform_style)
+        wf_line = "".join(_waveform_bar(float(p), waveform_style) for p in waveform_peaks)
         lines.append(Text(wf_line, style=theme.text_primary))
-
-        # Position marker
         if duration > 0:
-            ratio = position_sec / duration
+            ratio = max(0.0, min(1.0, position_sec / duration))
             marker_pos = min(int(ratio * len(waveform_peaks)), len(waveform_peaks) - 1)
-            marker_line = " " * marker_pos + "\u25b2"
+            marker_line = " " * marker_pos + "▲"
             lines.append(Text(marker_line, style=theme.accent))
 
     return Panel(
-        Text("\n").join(lines) if lines else Text("", style=theme.text_secondary),
+        Text("\n").join(lines) if lines else Text("  (no signal)", style=theme.text_secondary),
         title=f"VISUALIZER [{waveform_style.name}]",
         border_style=theme.border,
         box=box.DOUBLE,
@@ -519,13 +500,13 @@ def _render_header(theme: Theme, app_name: str = "musicli", crossfade: bool = Tr
     """Top bar with app name and controls hint."""
     text = Text()
     text.append(f"  {app_name}  ", style=theme.accent)
-    text.append("\u2502", style=theme.text_secondary)
+    text.append("│", style=theme.text_secondary)
     cf_str = "XF:ON " if crossfade else "XF:OFF"
     text.append(f" {cf_str} ", style=theme.accent if crossfade else theme.text_secondary)
-    text.append("\u2502", style=theme.text_secondary)
+    text.append("│", style=theme.text_secondary)
     text.append(
-        " SPACE:P/P  ENTER:Play  N/P:Prev  +/-:Vol  \u2190\u2192:Seek  123:EQ"
-        "  C:Crossf  W:Wave  T:Theme  A:Q+ D:Q-  ?:Help  Q:Quit",
+        " SPACE:P/P  ENTER:Play  N/P:Skip  +/-:Vol  ←→:Seek"
+        "  123:EQ  /:Search  ?:Help  Q:Quit",
         style=theme.text_secondary,
     )
     return Panel(text, border_style=theme.border, box=box.DOUBLE, style=f"on {theme.bg}")
@@ -542,15 +523,11 @@ class MusicliUI:
         self.layout = self._build_layout()
         self._live: Optional[Live] = None
 
-        # Current theme / style
         self.theme: Theme = DEFAULT_THEME
         self.waveform_style: WaveformStyle = WAVEFORM_STYLES[0]
-
-        # Help overlay state
         self.show_help: bool = False
-
-        # Cached cover art
         self.cover_art: Optional[Text] = None
+        self.search_active: bool = False
 
     def _build_layout(self) -> Layout:
         """Construct the 3-panel layout."""
@@ -569,6 +546,19 @@ class MusicliUI:
         )
         return root
 
+    def _rebuild_body(self) -> None:
+        """Restore the multi-panel body after help overlay."""
+        body = self.layout["body"]
+        # Clear any full-body renderable by rebuilding children
+        body.split_row(
+            Layout(name="left", ratio=1),
+            Layout(name="right", ratio=2),
+        )
+        body["right"].split(
+            Layout(name="now_playing", ratio=2),
+            Layout(name="visualizer", ratio=1),
+        )
+
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     def __enter__(self) -> MusicliUI:
@@ -585,7 +575,6 @@ class MusicliUI:
             self._live.stop()
 
     def start_live(self) -> Live:
-        """Begin the Live display context and return it."""
         self._live = Live(
             self.layout,
             refresh_per_second=15,
@@ -626,26 +615,52 @@ class MusicliUI:
         queue_indices: Optional[List[int]] = None,
         crossfade: bool = True,
         fft_stereo: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        search_active: bool = False,
     ) -> None:
         """Push the latest state into the layout panels."""
+        self.search_active = search_active
 
-        # Help overlay replaces the body
+        # Full-screen help: replace root content so Rich actually paints it
+        # (body has children → leaf-only render would ignore body.update)
         if self.show_help:
             help_panel = Panel(
                 Align.center(HELP_TEXT, vertical="middle"),
-                title="HELP",
+                title="HELP  —  press ? to close",
                 border_style="#00ff00",
                 box=box.DOUBLE,
                 padding=(1, 2),
                 style="on #000800",
             )
-            self.layout["body"].update(help_panel)
-            self.layout["header"].update(_render_header(self.theme, self.app_name, crossfade))
+            # Swap entire layout tree for a simple help layout
+            help_layout = Layout(name="root")
+            help_layout.split(
+                Layout(name="header", size=3),
+                Layout(name="help_body"),
+            )
+            help_layout["header"].update(
+                _render_header(self.theme, self.app_name, crossfade)
+            )
+            help_layout["help_body"].update(help_panel)
+            if self._live:
+                self._live.update(help_layout)
+            self._help_showing = True
             return
 
-        self.layout["header"].update(_render_header(self.theme, self.app_name, crossfade))
+        # Leaving help: restore multi-panel layout on the Live display
+        if getattr(self, "_help_showing", False):
+            self.layout = self._build_layout()
+            if self._live:
+                self._live.update(self.layout)
+            self._help_showing = False
+
+        self.layout["header"].update(
+            _render_header(self.theme, self.app_name, crossfade)
+        )
         self.layout["left"].update(
-            _render_library(tracks, current_idx, filter_text, self.theme, is_playing, queue_indices)
+            _render_library(
+                tracks, current_idx, filter_text, self.theme, is_playing,
+                queue_indices, search_active=search_active,
+            )
         )
         self.layout["now_playing"].update(
             _render_now_playing(
@@ -664,12 +679,14 @@ class MusicliUI:
         )
 
     def cycle_theme(self) -> None:
-        """Rotate to the next theme."""
         from musicli.themes import THEMES
         idx = THEMES.index(self.theme) if self.theme in THEMES else -1
         self.theme = THEMES[(idx + 1) % len(THEMES)]
 
     def cycle_waveform(self) -> None:
-        """Rotate to the next waveform style."""
-        idx = WAVEFORM_STYLES.index(self.waveform_style) if self.waveform_style in WAVEFORM_STYLES else -1
+        idx = (
+            WAVEFORM_STYLES.index(self.waveform_style)
+            if self.waveform_style in WAVEFORM_STYLES
+            else -1
+        )
         self.waveform_style = WAVEFORM_STYLES[(idx + 1) % len(WAVEFORM_STYLES)]
